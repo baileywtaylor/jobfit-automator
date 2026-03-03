@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Python environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local test job ads (keep folder, ignore contents)
+jobs_inbox/*
+!jobs_inbox/.gitkeep
+
+# Generated output
+output/
+cache/
