@@ -1,6 +1,6 @@
 ## Installation
 
-Standard install (recommended):
+Standard install Python 3.10+ recommended.
 
 pip install -r requirements.txt
 
