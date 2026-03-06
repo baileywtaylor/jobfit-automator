@@ -38,7 +38,7 @@ def setup_logging(verbose: bool) -> None:
 # -----------------------------
 # Constants
 # -----------------------------
-SCHEMA_VERSION = "v1"
+SCHEMA_VERSION = "v2"
 AI_MODEL = "gpt-4.1-mini"
 
 
@@ -162,29 +162,125 @@ def extract_job_with_ai(
             "title": {"type": ["string", "null"]},
             "company": {"type": ["string", "null"]},
             "location": {"type": ["string", "null"]},
+
+            "role_level": {
+                "type": ["string", "null"],
+                "enum": ["graduate", "entry", "junior", "mid", "senior", "unknown", None],
+            },
+            "program_type": {
+                "type": ["string", "null"],
+                "enum": ["grad_program", "standard_role", "unknown", None],
+            },
+            "work_mode": {
+                "type": ["string", "null"],
+                "enum": ["onsite", "hybrid", "remote", "unknown", None],
+            },
+            "contract_type": {
+                "type": ["string", "null"],
+                "enum": ["permanent", "contract", "internship", "unknown", None],
+            },
+
+            "tech_stack": {"type": "array", "items": {"type": "string"}},
             "must_haves": {"type": "array", "items": {"type": "string"}},
             "nice_to_haves": {"type": "array", "items": {"type": "string"}},
             "responsibilities": {"type": "array", "items": {"type": "string"}},
+            "growth_signals": {"type": "array", "items": {"type": "string"}},
+
+            "citizenship_required": {"type": ["boolean", "null"]},
+            "clearance_required": {"type": ["boolean", "null"]},
+
+            "risk_flags": {"type": "array", "items": {"type": "string"}},
+
+        "evidence": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "properties": {
+                "role_level": {"type": "array", "items": {"type": "string"}},
+                "program_type": {"type": "array", "items": {"type": "string"}},
+                "work_mode": {"type": "array", "items": {"type": "string"}},
+                "contract_type": {"type": "array", "items": {"type": "string"}},
+                "tech_stack": {"type": "array", "items": {"type": "string"}},
+                "growth_signals": {"type": "array", "items": {"type": "string"}},
+                "citizenship_required": {"type": "array", "items": {"type": "string"}},
+                "clearance_required": {"type": "array", "items": {"type": "string"}},
+                "risk_flags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": [
+                "role_level",
+                "program_type",
+                "work_mode",
+                "contract_type",
+                "tech_stack",
+                "growth_signals",
+                "citizenship_required",
+                "clearance_required",
+                "risk_flags",
+            ],
+        },
+
             "summary": {"type": ["string", "null"]},
         },
         "required": [
             "title",
             "company",
             "location",
+            "role_level",
+            "program_type",
+            "work_mode",
+            "contract_type",
+            "tech_stack",
             "must_haves",
             "nice_to_haves",
             "responsibilities",
+            "growth_signals",
+            "citizenship_required",
+            "clearance_required",
+            "risk_flags",
+            "evidence",
             "summary",
         ],
     }
 
     prompt = (
         "Extract structured information from this job advertisement.\n"
+        "Return valid JSON only.\n\n"
+
         "Rules:\n"
         "- If title/company/location not present, return null.\n"
+        "- role_level must be one of: graduate, entry, junior, mid, senior, unknown.\n"
+        "- program_type must be one of: grad_program, standard_role, unknown.\n"
+        "- work_mode must be one of: onsite, hybrid, remote, unknown.\n"
+        "- contract_type must be one of: permanent, contract, internship, unknown.\n"
+        "- If role_level, program_type, work_mode, or contract_type cannot be determined from the ad, return unknown.\n"
+        "- tech_stack should be a normalized list of technologies/tools explicitly mentioned or clearly implied.\n"
+        '- Normalize technologies to short canonical names where possible, e.g. "Amazon Web Services" -> "aws", '
+        '"Node.js" -> "node", "JavaScript" -> "javascript", "CI/CD" -> "ci/cd".\n'
         "- must_haves and nice_to_haves should be short skill phrases.\n"
         "- responsibilities should be concise bullet-like strings.\n"
-        "- summary should be 1–3 sentences.\n\n"
+        "- growth_signals should include only clear development signals such as mentorship, rotations, training, "
+        "certifications, career progression, security_rotation, software_rotation.\n"
+        "- citizenship_required should be true only if the ad explicitly requires citizenship or a specific nationality.\n"
+        "- clearance_required should be true only if the ad explicitly mentions security clearance or eligibility for clearance.\n"
+        "- contract_type should reflect whether the role is permanent, contract, internship, or unknown.\n"
+        "- risk_flags should only include objective concerns explicitly supported by the ad, such as unpaid, "
+        "commission_only, or extreme_hours.\n"
+        "- evidence should contain short supporting quotes/snippets from the job ad for key extracted fields when available.\n"
+        "- summary should be 1-3 sentences.\n"
+        "- Do not invent details that are not present in the job ad.\n\n"
+
+        "Suggested evidence structure:\n"
+        "{\n"
+        '  "role_level": ["snippet"],\n'
+        '  "program_type": ["snippet"],\n'
+        '  "work_mode": ["snippet"],\n'
+        '  "contract_type": ["snippet"],\n'
+        '  "tech_stack": ["snippet"],\n'
+        '  "growth_signals": ["snippet"],\n'
+        '  "citizenship_required": ["snippet"],\n'
+        '  "clearance_required": ["snippet"],\n'
+        '  "risk_flags": ["snippet"]\n'
+        "}\n\n"
+
         "JOB AD:\n"
         f"{job.raw_text}"
     )
@@ -232,6 +328,20 @@ def enrich_jobs_with_ai(
         job.nice_to_haves = ai_data.get("nice_to_haves", []) or []
         job.responsibilities = ai_data.get("responsibilities", []) or []
         job.summary = ai_data.get("summary")
+        job.role_level = ai_data.get("role_level")
+        job.program_type = ai_data.get("program_type")
+        job.work_mode = ai_data.get("work_mode")
+
+        job.tech_stack = ai_data.get("tech_stack", []) or []
+        job.growth_signals = ai_data.get("growth_signals", []) or []
+
+        job.citizenship_required = ai_data.get("citizenship_required")
+        job.clearance_required = ai_data.get("clearance_required")
+
+        job.contract_type = ai_data.get("contract_type")
+        job.risk_flags = ai_data.get("risk_flags", []) or []
+
+        job.evidence = ai_data.get("evidence")
 
 
 # -----------------------------
@@ -356,11 +466,13 @@ def main() -> None:
         preview = preview_src.replace("\n", " ").strip()
         print(f"{i}) {job.filename} — Score: {job.score}/100")
         if args.verbose:
-            print(f"   Must hits: {result.get('must_hits', [])}")
-            print(f"   Nice hits: {result.get('nice_hits', [])}")
-            if result.get("flags"):
-                print(f"   Flags: {result.get('flags')}")
-            print(f"   Preview: {preview}...\n")
+            print(f"   Role level: {job.role_level}")
+            print(f"   Program type: {job.program_type}")
+            print(f"   Work mode: {job.work_mode}")
+            print(f"   Contract type: {job.contract_type}")
+            print(f"   Tech stack: {job.tech_stack}")
+            print(f"   Growth signals: {job.growth_signals}")
+            print(f"   Clearance required: {job.clearance_required}")
 
     report_path = write_results_md(scored, profile, out_dir=args.out, top_n=args.top)
     print(f"\nReport written to: {report_path}")
