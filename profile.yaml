@@ -1,32 +1,143 @@
-scoring:
-  must_have_keywords:
-    - "python"
-    - "automation"
-    - "software"
-    - "developer"
-    - "engineering"
-    - "programming"
-    - "agile"
-    - "stakeholder"
+target:
+  role_levels:
+    - graduate
+    - entry
+    - junior
 
-  nice_to_have_keywords:
-    - "azure"
-    - "gcp"
-    - "cloud"
-    - "aws"
-    - "ci/cd"
-    - "devops"
-    - "rpa"
-    - "uipath"
-    - "blue prism"
-    - "selenium"
-    - "api"
-    - "rest"
-    - "database"
-    - "sql"
-    - "javascript"
-    - "react"
-    - "node"
-    - "c#"
-    - "java"
-    - "ocr"
+  preferred_role_clusters:
+    primary:
+      - software_engineering
+      - graduate_software
+    secondary:
+      - security_engineering
+      - cyber_rotation
+      - cloud_platform
+      - devops
+
+  preferred_locations:
+    - sydney
+    - remote
+
+  preferred_work_modes:
+    - hybrid
+    - remote
+    - onsite
+
+  company_preferences:
+    preferred_types:
+      - big_tech
+      - enterprise
+      - government
+      - consulting
+      - critical_infrastructure
+    value_reputation: true
+    value_engineering_maturity: true
+    value_structured_learning: true
+
+  growth_preferences:
+    prioritize:
+      - mentorship
+      - rotations
+      - training
+      - coaching
+      - career_progression
+      - security_rotation
+      - software_rotation
+
+eligibility:
+  australian_citizen: true
+  eligible_for_clearance: true
+
+skills:
+  strong:
+    - python
+    - javascript
+    - react
+    - node
+    - sql
+    - aws
+    - linux
+    - git
+    - ci/cd
+    - api
+    - rest
+
+  working:
+    - java
+    - c#
+    - postgresql
+    - azure_devops
+    - relational_data_modelling
+    - deployment_automation
+    - environment_configuration
+
+  basic:
+    - docker
+    - security
+    - ssh
+    - tls
+
+weights:
+  role_fit: 25
+  tech_match: 30
+  location: 15
+  company_quality: 15
+  growth: 10
+  risk: 5
+
+scoring_rules:
+  role_fit:
+    graduate: 25
+    entry: 22
+    junior: 20
+    mid: 8
+    senior: 0
+    unknown: 12
+
+  location:
+    sydney: 15
+    hybrid_sydney: 15
+    remote: 14
+    australia_other_hybrid: 10
+    australia_other_onsite: 6
+    unknown: 8
+
+  contract_penalty:
+    major_reputable_company: 0
+    reputable_enterprise: 1
+    unknown_mid_company: 2
+    small_startup: 3
+
+  hard_no:
+    - unpaid
+
+bonuses:
+  security_interest:
+    enabled: true
+    boost_if_present:
+      - security
+      - cyber
+      - application_security
+      - cloud_security
+      - security_rotation
+
+  structured_grad_program:
+    enabled: true
+    boost_if_present:
+      - grad_program
+      - rotations
+      - mentorship
+      - coaching
+
+normalization:
+  synonym_map:
+    amazon web services: aws
+    node.js: node
+    javascript: javascript
+    js: javascript
+    ci cd: ci/cd
+    cicd: ci/cd
+    rest api: rest
+    postgresql: postgresql
+    cyber security: security
+    cybersecurity: security
