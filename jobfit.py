@@ -1,8 +1,9 @@
 """
-JobFit Automator (V1)
-- Ingest job ads from jobs_inbox/*.txt
-- (Optional) AI-extract structured fields + summary with caching
-- Deterministic keyword scoring
+JobFit Automator
+- Paste a job ad into the CLI
+- Optional AI extraction with caching
+- Optional second-pass AI strategic evaluation with caching
+- Deterministic scoring against profile preferences
 - Writes output/results.md
 """
 
@@ -24,29 +25,29 @@ from openai import OpenAI
 from models import JobPosting
 
 
+logger = logging.getLogger("jobfit")
+
+SCHEMA_VERSION = "v4"
+AI_MODEL = "gpt-4.1-mini"
+
+
 # -----------------------------
 # Logging
 # -----------------------------
-logger = logging.getLogger("jobfit")
-
-
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
 
 # -----------------------------
-# Constants
-# -----------------------------
-SCHEMA_VERSION = "v2"
-AI_MODEL = "gpt-4.1-mini"
-
-
-# -----------------------------
-# Helpers
+# General helpers
 # -----------------------------
 def normalize(text: str) -> str:
-    return " ".join(text.lower().split())
+    return " ".join((text or "").lower().split())
+
+
+def normalize_token(value: str) -> str:
+    return normalize(value).replace("-", " ")
 
 
 def load_profile(profile_path: Path) -> Dict[str, Any]:
@@ -56,37 +57,48 @@ def load_profile(profile_path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def load_job_files(jobs_dir: Path) -> List[JobPosting]:
-    if not jobs_dir.exists():
-        logger.warning("%s folder not found.", jobs_dir)
-        return []
+def hash_job(text: str) -> str:
+    return hashlib.sha256((text + SCHEMA_VERSION).encode("utf-8")).hexdigest()
 
-    job_files = sorted(jobs_dir.glob("*.txt"))
-    if not job_files:
-        logger.warning("No job files found in %s.", jobs_dir)
-        return []
 
-    jobs: List[JobPosting] = []
-    for file_path in job_files:
-        try:
-            content = file_path.read_text(encoding="utf-8").strip()
-            if not content:
-                logger.warning("%s is empty. Skipping.", file_path.name)
-                continue
-            jobs.append(JobPosting(filename=file_path.name, raw_text=content))
-        except Exception as exc:
-            logger.error("Failed to read %s: %s", file_path.name, exc)
+def hash_eval(job_text: str, profile: Dict[str, Any]) -> str:
+    profile_fragment = json.dumps(
+        {
+            "preferred_locations": profile.get("target", {}).get("preferred_locations", []),
+            "preferred_work_modes": profile.get("target", {}).get("preferred_work_modes", []),
+            "role_levels": profile.get("target", {}).get("role_levels", []),
+            "preferred_role_clusters": profile.get("target", {}).get("preferred_role_clusters", {}),
+            "company_preferences": profile.get("target", {}).get("company_preferences", {}),
+            "growth_preferences": profile.get("target", {}).get("growth_preferences", {}),
+            "eligibility": profile.get("target", {}).get("eligibility", {}),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256((job_text + profile_fragment + "eval_v2").encode("utf-8")).hexdigest()
 
-    return jobs
+
+def build_openai_client() -> OpenAI | None:
+    load_dotenv(dotenv_path=".env")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+def recommendation_label(value: str | None) -> str:
+    labels = {
+        "strong_apply": "Strong Apply",
+        "apply": "Apply",
+        "stretch_apply": "Stretch Apply",
+        "low_priority": "Low Priority",
+        "skip": "Skip",
+    }
+    return labels.get((value or "").lower(), "Unknown")
 
 
 # -----------------------------
-# Scoring (hybrid deterministic V2)
+# Profile / normalization helpers
 # -----------------------------
-def normalize_token(value: str) -> str:
-    return normalize(value).replace("-", " ")
-
-
 def apply_synonym_map(tokens: List[str], profile: Dict[str, Any]) -> List[str]:
     synonym_map = profile.get("normalization", {}).get("synonym_map", {}) or {}
     normalized: List[str] = []
@@ -115,8 +127,12 @@ def get_profile_skill_buckets(profile: Dict[str, Any]) -> Dict[str, set[str]]:
     }
 
 
+# -----------------------------
+# Deterministic scoring
+# -----------------------------
 def score_role_fit(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str]]:
     rules = profile.get("scoring_rules", {}).get("role_fit", {}) or {}
+    max_score = float(profile.get("weights", {}).get("role_fit", 25))
     role_level = (job.role_level or "unknown").lower()
 
     score = float(rules.get(role_level, rules.get("unknown", 0)))
@@ -126,14 +142,20 @@ def score_role_fit(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, Lis
         score += 2
         reasons.append("Graduate program structure detected")
 
-    return min(score, float(profile.get("weights", {}).get("role_fit", 25))), reasons
+    return min(round(score, 1), max_score), reasons
 
 
 def score_tech_match(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str], List[str]]:
+    """
+    Current tech scoring remains mostly skill-match based.
+    This is intentionally left simpler for now; the next major iteration
+    should split tools vs domains vs methods.
+    """
     max_score = float(profile.get("weights", {}).get("tech_match", 30))
     job_stack = apply_synonym_map(job.tech_stack or [], profile)
+
     if not job_stack:
-        return max_score * 0.35, ["No clear tech stack extracted; assigning conservative partial score"], []
+        return round(max_score * 0.35, 1), ["No clear tech stack extracted; assigning conservative partial score"], []
 
     buckets = get_profile_skill_buckets(profile)
 
@@ -143,9 +165,9 @@ def score_tech_match(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, L
     missing = [t for t in job_stack if t not in buckets["all"]]
 
     matched_points = (
-        len(strong_hits) * 1.0 +
-        len(working_hits) * 0.7 +
-        len(basic_hits) * 0.4
+        len(strong_hits) * 1.0
+        + len(working_hits) * 0.7
+        + len(basic_hits) * 0.4
     )
     possible_points = max(len(job_stack), 1)
     ratio = min(matched_points / possible_points, 1.0)
@@ -169,8 +191,6 @@ def score_location_fit(job: JobPosting, profile: Dict[str, Any]) -> tuple[float,
     location_text = normalize(job.location or "")
     work_mode = (job.work_mode or "unknown").lower()
 
-    reasons: List[str] = []
-
     if "sydney" in location_text and work_mode == "hybrid":
         return float(rules.get("hybrid_sydney", 15)), ["Hybrid Sydney role"]
     if "sydney" in location_text:
@@ -182,31 +202,79 @@ def score_location_fit(job: JobPosting, profile: Dict[str, Any]) -> tuple[float,
     if work_mode == "onsite":
         return float(rules.get("australia_other_onsite", 6)), ["Onsite role outside Sydney or unspecified city"]
 
-    reasons.append("Location/work mode unclear")
-    return float(rules.get("unknown", 8)), reasons
+    return float(rules.get("unknown", 8)), ["Location/work mode unclear"]
+
+
+def score_company_quality(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str]]:
+    """
+    Company/program quality is now driven by structured AI judgments,
+    not hardcoded company-name lists.
+    """
+    max_score = float(profile.get("weights", {}).get("company_quality", 15))
+
+    score = 0.0
+    reasons: List[str] = []
+
+    if job.employer_signal == "strong":
+        score += 5.0
+        reasons.append("AI evaluation: strong employer signal")
+    elif job.employer_signal == "medium":
+        score += 3.0
+        reasons.append("AI evaluation: moderate employer signal")
+    elif job.employer_signal == "weak":
+        score += 1.0
+        reasons.append("AI evaluation: weak employer signal")
+
+    if job.program_quality == "strong":
+        score += 5.0
+        reasons.append("AI evaluation: strong program quality")
+    elif job.program_quality == "medium":
+        score += 3.0
+        reasons.append("AI evaluation: moderate program quality")
+    elif job.program_quality == "weak":
+        score += 1.0
+        reasons.append("AI evaluation: weak program quality")
+
+    if job.role_substance == "strong":
+        score += 3.0
+        reasons.append("AI evaluation: role appears substantive and meaningful")
+    elif job.role_substance == "medium":
+        score += 1.5
+        reasons.append("AI evaluation: role appears reasonably substantive")
+    elif job.role_substance == "weak":
+        score += 0.5
+        reasons.append("AI evaluation: role appears limited in substance")
+
+    if job.learning_environment == "strong":
+        score += 2.0
+        reasons.append("AI evaluation: strong learning environment")
+    elif job.learning_environment == "medium":
+        score += 1.0
+        reasons.append("AI evaluation: moderate learning environment")
+
+    return min(round(score, 1), max_score), reasons
 
 
 def score_growth(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str]]:
     max_score = float(profile.get("weights", {}).get("growth", 10))
-    growth_items = [normalize_token(x) for x in (job.growth_signals or [])]
-
-    reasons: List[str] = []
     score = 0.0
+    reasons: List[str] = []
 
+    # Light deterministic layer for explicit signals extracted from the ad
+    growth_items = [normalize_token(x) for x in (job.growth_signals or [])]
     growth_weights = {
-        "mentorship": 3.0,
-        "mentoring": 3.0,
-        "rotations": 4.0,
-        "rotation": 4.0,
-        "training": 2.0,
-        "coaching": 2.0,
-        "career progression": 2.0,
-        "career growth": 2.0,
-        "support and development": 2.0,
-        "learning & development platforms": 2.0,
-        "professional skills building": 2.0,
-        "security rotation": 2.0,
-        "software rotation": 2.0,
+        "mentorship": 2.0,
+        "mentoring": 2.0,
+        "training": 1.5,
+        "coaching": 1.5,
+        "certifications": 1.5,
+        "career progression": 1.5,
+        "career growth": 1.5,
+        "rotations": 2.0,
+        "rotation": 2.0,
+        "support and development": 1.5,
+        "learning & development platforms": 1.5,
+        "professional skills building": 1.5,
     }
 
     for item in growth_items:
@@ -217,54 +285,38 @@ def score_growth(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[
                 break
 
     if job.program_type == "grad_program":
-        score += 2
+        score += 1.5
         reasons.append("Structured graduate program detected")
 
-    return min(round(score, 1), max_score), reasons
+    # Primary signal now comes from AI evaluation
+    if job.learning_environment == "strong":
+        score += 2.5
+        reasons.append("AI evaluation: strong learning environment")
+    elif job.learning_environment == "medium":
+        score += 1.2
+        reasons.append("AI evaluation: moderate learning environment")
 
-
-def score_company_quality(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str]]:
-    max_score = float(profile.get("weights", {}).get("company_quality", 15))
-    company = normalize(job.company or "")
-    text = normalize(job.raw_text)
-
-    score = 0.0
-    reasons: List[str] = []
-
-    reputable_signals = [
-        "microsoft", "google", "amazon", "atlassian", "kpmg", "deloitte",
-        "ey", "pwc", "accenture", "lockheed", "arup", "government",
-        "department", "commbank", "westpac", "nab", "anz"
-    ]
-    maturity_signals = [
-        "graduate program", "mentoring", "coaching", "training",
-        "hybrid", "engineering lifecycle", "learning & development",
-        "real client work", "performance development"
-    ]
-
-    if any(signal in company for signal in reputable_signals):
-        score += 8
-        reasons.append("Reputable employer signal detected")
-    elif any(signal in text for signal in ["global", "enterprise", "consultancy", "government"]):
-        score += 6
-        reasons.append("Broad reputable/enterprise signal detected")
-
-    maturity_hits = [s for s in maturity_signals if s in text]
-    if maturity_hits:
-        score += min(len(maturity_hits), 4) * 1.5
-        reasons.append(f"Engineering maturity / structure signals: {', '.join(maturity_hits[:4])}")
+    if job.trajectory_value == "strong":
+        score += 2.0
+        reasons.append("AI evaluation: strong long-term trajectory value")
+    elif job.trajectory_value == "medium":
+        score += 1.0
+        reasons.append("AI evaluation: moderate long-term trajectory value")
 
     return min(round(score, 1), max_score), reasons
 
 
 def score_risk(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str], List[str]]:
+    """
+    Risk remains deterministic, but ambiguous offsets now come from AI-evaluated
+    employer/program quality rather than hardcoded employer lists.
+    """
     max_score = float(profile.get("weights", {}).get("risk", 5))
     score = max_score
     reasons: List[str] = []
     flags: List[str] = []
 
     risk_flags = [normalize_token(x) for x in (job.risk_flags or [])]
-    company = normalize(job.company or "")
     contract_type = (job.contract_type or "unknown").lower()
     location_text = normalize(job.location or "")
     work_mode = (job.work_mode or "unknown").lower()
@@ -276,29 +328,27 @@ def score_risk(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[st
             reasons.append(f"Hard rejection triggered by '{flag}'")
             return 0.0, reasons, flags
 
-    # Contract penalty is contextual
     if contract_type == "contract":
-        if any(x in company for x in ["microsoft", "google", "amazon", "atlassian"]):
-            penalty = 0
-            reasons.append("Contract role offset by major reputable employer")
-        elif any(x in company for x in ["kpmg", "deloitte", "ey", "pwc", "accenture", "lockheed", "arup"]):
-            penalty = 1
-            reasons.append("Small contract penalty due to reputable employer")
+        if job.program_quality == "strong" and job.employer_signal == "strong":
+            penalty = 0.5
+            reasons.append("Contract penalty reduced due to strong AI-evaluated program/employer quality")
+        elif job.program_quality in {"strong", "medium"} or job.employer_signal in {"strong", "medium"}:
+            penalty = 1.0
+            reasons.append("Small contract penalty due to positive AI-evaluated employer/program quality")
         else:
-            penalty = 2
+            penalty = 2.0
             reasons.append("Contract role penalty applied")
+
         score -= penalty
         flags.append("Contract role")
 
-    # Onsite outside Sydney penalty
     if work_mode == "onsite" and "sydney" not in location_text and location_text:
         score -= 2
         flags.append("Onsite outside Sydney")
         reasons.append("Onsite role outside Sydney")
 
-    # Clearance is not a penalty for you
     if job.clearance_required:
-        reasons.append("Clearance required, but no penalty applied")
+        reasons.append("Clearance/background checks required, but no penalty applied")
 
     return max(round(score, 1), 0.0), reasons, flags
 
@@ -312,77 +362,45 @@ def score_job_hybrid(job: JobPosting, profile: Dict[str, Any]) -> Dict[str, Any]
     risk_score, risk_reasons, flags = score_risk(job, profile)
 
     hard_reject = any(flag.lower().startswith("hard no:") for flag in flags)
-
-    if hard_reject:
-        total = 0.0
-    else:
-        total = round(
-            role_score + tech_score + location_score + company_score + growth_score + risk_score,
-            1
-        )
-
-    score_breakdown = {
-        "role_fit": round(role_score, 1),
-        "tech_match": round(tech_score, 1),
-        "location": round(location_score, 1),
-        "company_quality": round(company_score, 1),
-        "growth": round(growth_score, 1),
-        "risk": round(risk_score, 1),
-    }
-
-    reasons = {
-        "role_fit": role_reasons,
-        "tech_match": tech_reasons,
-        "location": location_reasons,
-        "company_quality": company_reasons,
-        "growth": growth_reasons,
-        "risk": risk_reasons,
-    }
+    total = 0.0 if hard_reject else round(
+        role_score + tech_score + location_score + company_score + growth_score + risk_score,
+        1
+    )
 
     return {
         "score": total,
-        "score_breakdown": score_breakdown,
+        "score_breakdown": {
+            "role_fit": round(role_score, 1),
+            "tech_match": round(tech_score, 1),
+            "location": round(location_score, 1),
+            "company_quality": round(company_score, 1),
+            "growth": round(growth_score, 1),
+            "risk": round(risk_score, 1),
+        },
         "missing_skills": missing_skills,
         "flags": flags,
-        "reasons": reasons,
+        "reasons": {
+            "role_fit": role_reasons,
+            "tech_match": tech_reasons,
+            "location": location_reasons,
+            "company_quality": company_reasons,
+            "growth": growth_reasons,
+            "risk": risk_reasons,
+        },
     }
 
 
 # -----------------------------
-# AI Extraction (cached)
+# AI extraction
 # -----------------------------
-def hash_job(text: str) -> str:
-    return hashlib.sha256((text + SCHEMA_VERSION).encode("utf-8")).hexdigest()
-
-
-def build_openai_client() -> OpenAI | None:
-    load_dotenv(dotenv_path=".env")
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
-
-
-def extract_job_with_ai(
-    client: OpenAI,
-    job: JobPosting,
-    cache_dir: Path,
-) -> Dict[str, Any]:
-    """
-    AI-extract structured fields from a job ad.
-    Uses cache/sha256(job_text + schema_version).json to avoid repeat calls.
-    Returns {} if extraction fails.
-    """
-    job_hash = hash_job(job.raw_text)
-    cache_file = cache_dir / f"{job_hash}.json"
+def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dict[str, Any]:
+    cache_file = cache_dir / f"{hash_job(job.raw_text)}.json"
 
     if cache_file.exists():
         try:
             return json.loads(cache_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            logger.warning("Corrupted cache file %s. Regenerating.", cache_file.name)
         except Exception as exc:
-            logger.warning("Failed reading cache file %s: %s. Regenerating.", cache_file.name, exc)
+            logger.warning("Failed reading extraction cache %s: %s. Regenerating.", cache_file.name, exc)
 
     schema = {
         "type": "object",
@@ -391,7 +409,6 @@ def extract_job_with_ai(
             "title": {"type": ["string", "null"]},
             "company": {"type": ["string", "null"]},
             "location": {"type": ["string", "null"]},
-
             "role_level": {
                 "type": ["string", "null"],
                 "enum": ["graduate", "entry", "junior", "mid", "senior", "unknown", None],
@@ -408,45 +425,40 @@ def extract_job_with_ai(
                 "type": ["string", "null"],
                 "enum": ["permanent", "contract", "internship", "unknown", None],
             },
-
             "tech_stack": {"type": "array", "items": {"type": "string"}},
             "must_haves": {"type": "array", "items": {"type": "string"}},
             "nice_to_haves": {"type": "array", "items": {"type": "string"}},
             "responsibilities": {"type": "array", "items": {"type": "string"}},
             "growth_signals": {"type": "array", "items": {"type": "string"}},
-
             "citizenship_required": {"type": ["boolean", "null"]},
             "clearance_required": {"type": ["boolean", "null"]},
-
             "risk_flags": {"type": "array", "items": {"type": "string"}},
-
-        "evidence": {
-            "type": ["object", "null"],
-            "additionalProperties": False,
-            "properties": {
-                "role_level": {"type": "array", "items": {"type": "string"}},
-                "program_type": {"type": "array", "items": {"type": "string"}},
-                "work_mode": {"type": "array", "items": {"type": "string"}},
-                "contract_type": {"type": "array", "items": {"type": "string"}},
-                "tech_stack": {"type": "array", "items": {"type": "string"}},
-                "growth_signals": {"type": "array", "items": {"type": "string"}},
-                "citizenship_required": {"type": "array", "items": {"type": "string"}},
-                "clearance_required": {"type": "array", "items": {"type": "string"}},
-                "risk_flags": {"type": "array", "items": {"type": "string"}},
+            "evidence": {
+                "type": ["object", "null"],
+                "additionalProperties": False,
+                "properties": {
+                    "role_level": {"type": "array", "items": {"type": "string"}},
+                    "program_type": {"type": "array", "items": {"type": "string"}},
+                    "work_mode": {"type": "array", "items": {"type": "string"}},
+                    "contract_type": {"type": "array", "items": {"type": "string"}},
+                    "tech_stack": {"type": "array", "items": {"type": "string"}},
+                    "growth_signals": {"type": "array", "items": {"type": "string"}},
+                    "citizenship_required": {"type": "array", "items": {"type": "string"}},
+                    "clearance_required": {"type": "array", "items": {"type": "string"}},
+                    "risk_flags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "role_level",
+                    "program_type",
+                    "work_mode",
+                    "contract_type",
+                    "tech_stack",
+                    "growth_signals",
+                    "citizenship_required",
+                    "clearance_required",
+                    "risk_flags",
+                ],
             },
-            "required": [
-                "role_level",
-                "program_type",
-                "work_mode",
-                "contract_type",
-                "tech_stack",
-                "growth_signals",
-                "citizenship_required",
-                "clearance_required",
-                "risk_flags",
-            ],
-        },
-
             "summary": {"type": ["string", "null"]},
         },
         "required": [
@@ -473,43 +485,24 @@ def extract_job_with_ai(
     prompt = (
         "Extract structured information from this job advertisement.\n"
         "Return valid JSON only.\n\n"
-
         "Rules:\n"
-        "- If title/company/location not present, return null.\n"
+        "- If title/company/location are not explicitly present, return null.\n"
         "- role_level must be one of: graduate, entry, junior, mid, senior, unknown.\n"
         "- program_type must be one of: grad_program, standard_role, unknown.\n"
         "- work_mode must be one of: onsite, hybrid, remote, unknown.\n"
         "- contract_type must be one of: permanent, contract, internship, unknown.\n"
-        "- If role_level, program_type, work_mode, or contract_type cannot be determined from the ad, return unknown.\n"
+        "- If role_level, program_type, work_mode, or contract_type cannot be determined, return unknown.\n"
         "- tech_stack should be a normalized list of technologies/tools explicitly mentioned or clearly implied.\n"
-        '- Normalize technologies to short canonical names where possible, e.g. "Amazon Web Services" -> "aws", '
-        '"Node.js" -> "node", "JavaScript" -> "javascript", "CI/CD" -> "ci/cd".\n'
+        "- Normalize technologies to short canonical names where reasonable.\n"
         "- must_haves and nice_to_haves should be short skill phrases.\n"
         "- responsibilities should be concise bullet-like strings.\n"
-        "- growth_signals should include only clear development signals such as mentorship, rotations, training, "
-        "certifications, career progression, security_rotation, software_rotation.\n"
-        "- citizenship_required should be true only if the ad explicitly requires citizenship or a specific nationality.\n"
-        "- clearance_required should be true only if the ad explicitly mentions security clearance or eligibility for clearance.\n"
-        "- contract_type should reflect whether the role is permanent, contract, internship, or unknown.\n"
-        "- risk_flags should only include objective concerns explicitly supported by the ad, such as unpaid, "
-        "commission_only, or extreme_hours.\n"
-        "- evidence should contain short supporting quotes/snippets from the job ad for key extracted fields when available.\n"
+        "- growth_signals should include only clear development signals such as mentorship, rotations, training, certifications, coaching, career progression.\n"
+        "- citizenship_required should be true only if explicitly required.\n"
+        "- clearance_required should be true only if explicitly required.\n"
+        "- risk_flags should only include objective concerns explicitly supported by the ad.\n"
+        "- evidence should contain short supporting snippets from the ad.\n"
         "- summary should be 1-3 sentences.\n"
-        "- Do not invent details that are not present in the job ad.\n\n"
-
-        "Suggested evidence structure:\n"
-        "{\n"
-        '  "role_level": ["snippet"],\n'
-        '  "program_type": ["snippet"],\n'
-        '  "work_mode": ["snippet"],\n'
-        '  "contract_type": ["snippet"],\n'
-        '  "tech_stack": ["snippet"],\n'
-        '  "growth_signals": ["snippet"],\n'
-        '  "citizenship_required": ["snippet"],\n'
-        '  "clearance_required": ["snippet"],\n'
-        '  "risk_flags": ["snippet"]\n'
-        "}\n\n"
-
+        "- Do not invent details.\n\n"
         "JOB AD:\n"
         f"{job.raw_text}"
     )
@@ -527,13 +520,181 @@ def extract_job_with_ai(
                 }
             },
         )
-
         data = json.loads(response.output_text)
         cache_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         return data
-
     except Exception as exc:
         logger.error("AI extraction failed for %s: %s", job.filename, exc)
+        return {}
+
+
+# -----------------------------
+# AI strategic evaluation
+# -----------------------------
+def evaluate_job_with_ai(
+    client: OpenAI,
+    job: JobPosting,
+    profile: Dict[str, Any],
+    cache_dir: Path,
+) -> Dict[str, Any]:
+    cache_file = cache_dir / f"{hash_eval(job.raw_text, profile)}.eval.json"
+
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed reading evaluation cache %s: %s. Regenerating.", cache_file.name, exc)
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "structural_fit_summary": {"type": ["string", "null"]},
+            "strategic_fit_summary": {"type": ["string", "null"]},
+            "recommendation": {
+                "type": "string",
+                "enum": ["strong_apply", "apply", "stretch_apply", "low_priority", "skip"],
+            },
+            "program_quality": {
+                "type": "string",
+                "enum": ["strong", "medium", "weak", "unknown"],
+            },
+            "role_substance": {
+                "type": "string",
+                "enum": ["strong", "medium", "weak", "unknown"],
+            },
+            "learning_environment": {
+                "type": "string",
+                "enum": ["strong", "medium", "weak", "unknown"],
+            },
+            "trajectory_value": {
+                "type": "string",
+                "enum": ["strong", "medium", "weak", "unknown"],
+            },
+            "employer_signal": {
+                "type": "string",
+                "enum": ["strong", "medium", "weak", "unknown"],
+            },
+            "gap_severity": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "unknown"],
+            },
+            "strategic_reasons": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "caution_reasons": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "evidence": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "program_quality": {"type": "array", "items": {"type": "string"}},
+                    "learning_environment": {"type": "array", "items": {"type": "string"}},
+                    "trajectory_value": {"type": "array", "items": {"type": "string"}},
+                    "recommendation": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "program_quality",
+                    "learning_environment",
+                    "trajectory_value",
+                    "recommendation",
+                ],
+            },
+        },
+        "required": [
+            "structural_fit_summary",
+            "strategic_fit_summary",
+            "recommendation",
+            "program_quality",
+            "role_substance",
+            "learning_environment",
+            "trajectory_value",
+            "employer_signal",
+            "gap_severity",
+            "strategic_reasons",
+            "caution_reasons",
+            "evidence",
+        ],
+    }
+
+    profile_context = {
+        "preferred_locations": profile.get("target", {}).get("preferred_locations", []),
+        "preferred_work_modes": profile.get("target", {}).get("preferred_work_modes", []),
+        "role_levels": profile.get("target", {}).get("role_levels", []),
+        "preferred_role_clusters": profile.get("target", {}).get("preferred_role_clusters", {}),
+        "company_preferences": profile.get("target", {}).get("company_preferences", {}),
+        "growth_preferences": profile.get("target", {}).get("growth_preferences", {}),
+        "eligibility": profile.get("target", {}).get("eligibility", {}),
+    }
+
+    extracted_context = {
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+        "role_level": job.role_level,
+        "program_type": job.program_type,
+        "work_mode": job.work_mode,
+        "contract_type": job.contract_type,
+        "tech_stack": job.tech_stack,
+        "must_haves": job.must_haves,
+        "nice_to_haves": job.nice_to_haves,
+        "responsibilities": job.responsibilities,
+        "growth_signals": job.growth_signals,
+        "citizenship_required": job.citizenship_required,
+        "clearance_required": job.clearance_required,
+        "risk_flags": job.risk_flags,
+        "summary": job.summary,
+    }
+
+    prompt = (
+        "Evaluate this job advertisement for career fit.\n"
+        "Return valid JSON only.\n\n"
+        "You are not scoring numerically. You are making structured judgments that will later be converted into deterministic points.\n\n"
+        "Candidate preferences:\n"
+        f"{json.dumps(profile_context, indent=2)}\n\n"
+        "Extracted job context:\n"
+        f"{json.dumps(extracted_context, indent=2)}\n\n"
+        "Rules:\n"
+        "- structural_fit_summary should briefly explain whether the role matches hard preferences such as location, role level, work mode, and eligibility.\n"
+        "- strategic_fit_summary should explain whether the role is genuinely strong for early-career growth.\n"
+        "- recommendation must be one of: strong_apply, apply, stretch_apply, low_priority, skip.\n"
+        "- program_quality reflects how structured and well-supported the program/role appears.\n"
+        "- role_substance reflects whether the work sounds real and meaningful.\n"
+        "- learning_environment reflects evidence of mentoring, training, coaching, certifications, and support.\n"
+        "- trajectory_value reflects whether the role builds useful long-term career capital.\n"
+        "- employer_signal reflects reputation/signalling value for an early-career applicant.\n"
+        "- gap_severity should be LOW when missing experience appears learnable within the role or normal for a graduate hire.\n"
+        "- Broad domains such as ai, cloud, data analytics, digital transformation, and machine learning should NOT automatically be treated as hard disqualifying gaps.\n"
+        "- For graduate roles, distinguish between true blockers and learnable exposure areas.\n"
+        "- strategic_reasons should be concise, high-value reasons the role is attractive.\n"
+        "- caution_reasons should be concise and realistic.\n"
+        "- evidence should contain short snippets or references from the ad supporting your judgment.\n"
+        "- Do not invent facts not supported by the ad.\n\n"
+        "JOB AD:\n"
+        f"{job.raw_text}"
+    )
+
+    try:
+        response = client.responses.create(
+            model=AI_MODEL,
+            input=prompt,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "job_evaluation",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+        )
+        data = json.loads(response.output_text)
+        cache_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        return data
+    except Exception as exc:
+        logger.error("AI evaluation failed for %s: %s", job.filename, exc)
         return {}
 
 
@@ -541,44 +702,55 @@ def enrich_jobs_with_ai(
     jobs: List[JobPosting],
     client: OpenAI,
     cache_dir: Path,
+    profile: Dict[str, Any],
 ) -> None:
-    """
-    Mutates JobPosting objects in-place with AI extracted fields.
-    """
     for job in jobs:
         ai_data = extract_job_with_ai(client=client, job=job, cache_dir=cache_dir)
-        if not ai_data:
-            continue
+        if ai_data:
+            job.title = ai_data.get("title")
+            job.company = ai_data.get("company")
+            job.location = ai_data.get("location")
+            job.must_haves = ai_data.get("must_haves", []) or []
+            job.nice_to_haves = ai_data.get("nice_to_haves", []) or []
+            job.responsibilities = ai_data.get("responsibilities", []) or []
+            job.summary = ai_data.get("summary")
+            job.role_level = ai_data.get("role_level")
+            job.program_type = ai_data.get("program_type")
+            job.work_mode = ai_data.get("work_mode")
+            job.tech_stack = ai_data.get("tech_stack", []) or []
+            job.growth_signals = ai_data.get("growth_signals", []) or []
+            job.citizenship_required = ai_data.get("citizenship_required")
+            job.clearance_required = ai_data.get("clearance_required")
+            job.contract_type = ai_data.get("contract_type")
+            job.risk_flags = ai_data.get("risk_flags", []) or []
+            job.evidence = ai_data.get("evidence")
 
-        job.title = ai_data.get("title")
-        job.company = ai_data.get("company")
-        job.location = ai_data.get("location")
-        job.must_haves = ai_data.get("must_haves", []) or []
-        job.nice_to_haves = ai_data.get("nice_to_haves", []) or []
-        job.responsibilities = ai_data.get("responsibilities", []) or []
-        job.summary = ai_data.get("summary")
-        job.role_level = ai_data.get("role_level")
-        job.program_type = ai_data.get("program_type")
-        job.work_mode = ai_data.get("work_mode")
-
-        job.tech_stack = ai_data.get("tech_stack", []) or []
-        job.growth_signals = ai_data.get("growth_signals", []) or []
-
-        job.citizenship_required = ai_data.get("citizenship_required")
-        job.clearance_required = ai_data.get("clearance_required")
-
-        job.contract_type = ai_data.get("contract_type")
-        job.risk_flags = ai_data.get("risk_flags", []) or []
-
-        job.evidence = ai_data.get("evidence")
+        eval_data = evaluate_job_with_ai(
+            client=client,
+            job=job,
+            profile=profile,
+            cache_dir=cache_dir,
+        )
+        if eval_data:
+            job.structural_fit_summary = eval_data.get("structural_fit_summary")
+            job.strategic_fit_summary = eval_data.get("strategic_fit_summary")
+            job.recommendation = eval_data.get("recommendation")
+            job.program_quality = eval_data.get("program_quality")
+            job.role_substance = eval_data.get("role_substance")
+            job.learning_environment = eval_data.get("learning_environment")
+            job.trajectory_value = eval_data.get("trajectory_value")
+            job.employer_signal = eval_data.get("employer_signal")
+            job.gap_severity = eval_data.get("gap_severity")
+            job.strategic_reasons = eval_data.get("strategic_reasons", []) or []
+            job.caution_reasons = eval_data.get("caution_reasons", []) or []
+            job.ai_evaluation_evidence = eval_data.get("evidence", {}) or {}
 
 
 # -----------------------------
-# Report output
+# Output
 # -----------------------------
 def write_results_md(
     scored: List[Tuple[JobPosting, Dict[str, Any]]],
-    profile: Dict[str, Any],
     out_dir: Path,
     top_n: int,
 ) -> Path:
@@ -586,11 +758,12 @@ def write_results_md(
     out_path = out_dir / "results.md"
     run_date = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    lines: List[str] = []
-    lines.append("# JobFit Analysis")
-    lines.append(f"Run date: {run_date}")
-    lines.append(f"Jobs processed: {len(scored)}")
-    lines.append("")
+    lines: List[str] = [
+        "# JobFit Analysis",
+        f"Run date: {run_date}",
+        f"Jobs processed: {len(scored)}",
+        "",
+    ]
 
     if not scored:
         lines.append("No jobs were scored.")
@@ -601,7 +774,6 @@ def write_results_md(
         title = job.title or job.filename.replace(".txt", "")
         company = job.company or "Unknown"
         location = job.location or "Unknown"
-
         breakdown = job.score_breakdown or {}
         flags = result.get("flags") or []
         reasons = result.get("reasons") or {}
@@ -609,27 +781,43 @@ def write_results_md(
 
         lines.append(f"## {idx}) {title} — {company}")
         lines.append(f"**Score:** {job.score}/100")
+        lines.append(f"**Recommendation:** {recommendation_label(job.recommendation)}")
         lines.append(f"**Location:** {location}")
         lines.append(f"**Work mode:** {job.work_mode or 'Unknown'}")
         lines.append(f"**Role level:** {job.role_level or 'Unknown'}")
         lines.append(f"**Program type:** {job.program_type or 'Unknown'}")
         lines.append("")
 
-        lines.append("### Breakdown")
+        lines.append("### Structural Fit")
+        lines.append(job.structural_fit_summary or "No structured fit summary available.")
+        lines.append("")
+
+        lines.append("### Why This Role Is Strategically Strong")
+        if job.strategic_fit_summary:
+            lines.append(job.strategic_fit_summary)
+            lines.append("")
+        if job.strategic_reasons:
+            for reason in job.strategic_reasons:
+                lines.append(f"- {reason}")
+        else:
+            lines.append("- No strategic reasons available")
+        lines.append("")
+
+        lines.append("### Main Gaps / Cautions")
+        if job.caution_reasons:
+            for reason in job.caution_reasons:
+                lines.append(f"- {reason}")
+        else:
+            lines.append("- None identified")
+        lines.append("")
+
+        lines.append("### Score Breakdown")
         lines.append(f"- Role Fit: {breakdown.get('role_fit', 0)}/25")
         lines.append(f"- Tech Match: {breakdown.get('tech_match', 0)}/30")
         lines.append(f"- Location: {breakdown.get('location', 0)}/15")
         lines.append(f"- Company/Program: {breakdown.get('company_quality', 0)}/15")
         lines.append(f"- Growth: {breakdown.get('growth', 0)}/10")
         lines.append(f"- Risk: {breakdown.get('risk', 0)}/5")
-        lines.append("")
-
-        lines.append("### Summary")
-        if job.summary:
-            lines.append(job.summary.strip())
-        else:
-            preview = job.raw_text[:300].replace("\n", " ").strip()
-            lines.append(preview + ("..." if len(job.raw_text) > 300 else ""))
         lines.append("")
 
         lines.append("### Missing Skills")
@@ -649,7 +837,6 @@ def write_results_md(
         lines.append("")
 
         lines.append("### Why this scored the way it did")
-
         for category_label, key in [
             ("Role Fit", "role_fit"),
             ("Tech Match", "tech_match"),
@@ -658,8 +845,8 @@ def write_results_md(
             ("Growth", "growth"),
             ("Risk", "risk"),
         ]:
-            category_reasons = reasons.get(key, []) or []
             lines.append(f"**{category_label}**")
+            category_reasons = reasons.get(key, []) or []
             if category_reasons:
                 for reason in category_reasons:
                     lines.append(f"- {reason}")
@@ -678,8 +865,7 @@ def write_results_md(
 # CLI
 # -----------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="JobFit Automator (V1)")
-    parser.add_argument("--inbox", type=Path, default=Path("jobs_inbox"), help="Folder containing *.txt job ads")
+    parser = argparse.ArgumentParser(description="JobFit Automator")
     parser.add_argument("--profile", type=Path, default=Path("profile.yaml"), help="Path to profile.yaml")
     parser.add_argument("--out", type=Path, default=Path("output"), help="Output folder")
     parser.add_argument("--cache", type=Path, default=Path("cache"), help="Cache folder")
@@ -688,81 +874,62 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Verbose logs")
     return parser.parse_args()
 
+
 def read_pasted_job() -> str:
     print("\nPaste the job description below.")
     print("Type ::end on a new line when finished.\n")
 
-    lines = []
-
+    lines: List[str] = []
     while True:
         line = input()
         if line.strip() == "::end":
             break
         lines.append(line)
 
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
 
-# -----------------------------
-# Main
-# -----------------------------
-def main() -> None:
-    args = parse_args()
-    setup_logging(args.verbose)
 
-    args.cache.mkdir(parents=True, exist_ok=True)
-    args.out.mkdir(parents=True, exist_ok=True)
+def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> None:
+    title = job.title or job.filename.replace(".txt", "")
+    company = job.company or "Unknown"
+    location = job.location or "Unknown"
+    breakdown = job.score_breakdown or {}
+    flags = result.get("flags") or []
+    reasons = result.get("reasons") or {}
 
-    logger.info("JobFit Automator — V1 (Rules + Optional AI Enrichment)")
-    profile = load_profile(args.profile)
+    print(f"\nJob: {title} — {company}")
+    print(f"Score: {job.score}/100")
+    print(f"Recommendation: {recommendation_label(job.recommendation)}")
+    print(f"Location: {location}")
+    print(f"Work mode: {job.work_mode or 'Unknown'}")
+    print(f"Role level: {job.role_level or 'Unknown'}")
+    print(f"Program type: {job.program_type or 'Unknown'}")
 
-    job_text = read_pasted_job()
+    if job.structural_fit_summary:
+        print("\nStructural Fit")
+        print(job.structural_fit_summary)
 
-    job = JobPosting(
-        filename="pasted_job",
-        raw_text=job_text
-    )
+    if job.strategic_fit_summary:
+        print("\nStrategic Fit")
+        print(job.strategic_fit_summary)
 
-    jobs = [job]
+    if job.strategic_reasons:
+        print("\nWhy this role is strategically strong")
+        for reason in job.strategic_reasons:
+            print(f"- {reason}")
 
-    client = None if args.no_ai else build_openai_client()
+    if job.caution_reasons:
+        print("\nMain gaps / cautions")
+        for reason in job.caution_reasons:
+            print(f"- {reason}")
 
-    if client is None:
-        logger.info("AI enrichment disabled (no key or --no-ai).")
-    else:
-        logger.info("AI enrichment enabled (cached).")
-        enrich_jobs_with_ai(jobs, client=client, cache_dir=args.cache)
-
-    scored: List[Tuple[JobPosting, Dict[str, Any]]] = []
-
-    for job in jobs:
-        result = score_job_hybrid(job, profile)
-        job.score = result["score"]
-        job.score_breakdown = result["score_breakdown"]
-        job.missing_skills = result["missing_skills"]
-        scored.append((job, result))
-
-    for i, (job, result) in enumerate(scored, start=1):
-        title = job.title or job.filename.replace(".txt", "")
-        company = job.company or "Unknown"
-        location = job.location or "Unknown"
-        breakdown = job.score_breakdown or {}
-        flags = result.get("flags") or []
-        reasons = result.get("reasons") or {}
-
-        print(f"\nJob: {title} — {company}")
-        print(f"Score: {job.score}/100")
-        print(f"Location: {location}")
-        print(f"Work mode: {job.work_mode or 'Unknown'}")
-        print(f"Role level: {job.role_level or 'Unknown'}")
-        print(f"Program type: {job.program_type or 'Unknown'}")
-
-        print("\nBreakdown")
-        print(f"- Role Fit: {breakdown.get('role_fit', 0)}/25")
-        print(f"- Tech Match: {breakdown.get('tech_match', 0)}/30")
-        print(f"- Location: {breakdown.get('location', 0)}/15")
-        print(f"- Company/Program: {breakdown.get('company_quality', 0)}/15")
-        print(f"- Growth: {breakdown.get('growth', 0)}/10")
-        print(f"- Risk: {breakdown.get('risk', 0)}/5")
+    print("\nBreakdown")
+    print(f"- Role Fit: {breakdown.get('role_fit', 0)}/25")
+    print(f"- Tech Match: {breakdown.get('tech_match', 0)}/30")
+    print(f"- Location: {breakdown.get('location', 0)}/15")
+    print(f"- Company/Program: {breakdown.get('company_quality', 0)}/15")
+    print(f"- Growth: {breakdown.get('growth', 0)}/10")
+    print(f"- Risk: {breakdown.get('risk', 0)}/5")
 
     print("\nMissing Skills")
     if job.missing_skills:
@@ -795,17 +962,56 @@ def main() -> None:
         else:
             print("  - No specific notes")
 
-    if args.verbose:
+    if verbose:
         print("\nRaw extracted fields")
         print(f"- Tech stack: {job.tech_stack}")
         print(f"- Growth signals: {job.growth_signals}")
         print(f"- Contract type: {job.contract_type}")
         print(f"- Clearance required: {job.clearance_required}")
         print(f"- Citizenship required: {job.citizenship_required}")
+        print(f"- AI evidence: {job.ai_evaluation_evidence}")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    args = parse_args()
+    setup_logging(args.verbose)
+
+    args.cache.mkdir(parents=True, exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    profile = load_profile(args.profile)
+    job_text = read_pasted_job()
+
+    if not job_text:
+        logger.error("No job text provided.")
+        return
+
+    jobs = [JobPosting(filename="pasted_job", raw_text=job_text)]
+    client = None if args.no_ai else build_openai_client()
+
+    if client is None:
+        logger.info("AI enrichment disabled (no key or --no-ai).")
+    else:
+        logger.info("AI enrichment enabled (cached).")
+        enrich_jobs_with_ai(jobs, client=client, cache_dir=args.cache, profile=profile)
+
+    scored: List[Tuple[JobPosting, Dict[str, Any]]] = []
+    for job in jobs:
+        result = score_job_hybrid(job, profile)
+        job.score = result["score"]
+        job.score_breakdown = result["score_breakdown"]
+        job.missing_skills = result["missing_skills"]
+        scored.append((job, result))
 
     scored.sort(key=lambda x: (x[0].score or 0, x[0].filename), reverse=True)
 
-    report_path = write_results_md(scored, profile, out_dir=args.out, top_n=args.top)
+    for job, result in scored:
+        print_job_result(job, result, verbose=args.verbose)
+
+    report_path = write_results_md(scored, out_dir=args.out, top_n=args.top)
     print(f"\nReport written to: {report_path}")
 
 

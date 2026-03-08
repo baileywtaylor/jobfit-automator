@@ -2,9 +2,28 @@ from __future__ import annotations
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
+
 class JobPosting(BaseModel):
     filename: str
     raw_text: str
+
+    # AI strategic evaluation
+    structural_fit_summary: Optional[str] = None
+    strategic_fit_summary: Optional[str] = None
+
+    recommendation: Optional[str] = None   # strong_apply | apply | stretch_apply | low_priority | skip
+
+    program_quality: Optional[str] = None      # strong | medium | weak | unknown
+    role_substance: Optional[str] = None       # strong | medium | weak | unknown
+    learning_environment: Optional[str] = None # strong | medium | weak | unknown
+    trajectory_value: Optional[str] = None     # strong | medium | weak | unknown
+    employer_signal: Optional[str] = None      # strong | medium | weak | unknown
+    gap_severity: Optional[str] = None         # low | medium | high | unknown
+
+    strategic_reasons: List[str] = Field(default_factory=list)
+    caution_reasons: List[str] = Field(default_factory=list)
+    ai_evaluation_evidence: Dict[str, Any] = Field(default_factory=dict)
+    ai_evaluation_evidence: Dict[str, Any] = Field(default_factory=dict)
 
     # Basic AI-enriched fields
     title: Optional[str] = None
@@ -46,7 +65,6 @@ class JobPosting(BaseModel):
     evidence: Optional[Dict[str, Any]] = None
 
     # Scoring results
-
     score: Optional[float] = None
 
     # category breakdown (filled later by scoring engine)
