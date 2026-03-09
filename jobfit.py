@@ -1138,7 +1138,7 @@ def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> 
     location = job.location or "Unknown"
     breakdown = job.score_breakdown or {}
     flags = result.get("flags") or []
-    reasons = result.get("reasons") or {}
+    reasons = result.get("reasons") or []
 
     print(f"\nJob: {title} — {company}")
     print(f"Score: {job.score}/100")
@@ -1150,74 +1150,88 @@ def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> 
         for flag in ineligible_flags:
             print(f"- {flag}")
 
-    print(f"Location: {location}")
-    print(f"Work mode: {job.work_mode or 'Unknown'}")
-    print(f"Role level: {job.role_level or 'Unknown'}")
-    print(f"Program type: {job.program_type or 'Unknown'}")
-
-    if job.structural_fit_summary:
-        print("\nStructural Fit")
-        print(job.structural_fit_summary)
-
-    if job.strategic_fit_summary:
-        print("\nStrategic Fit")
-        print(job.strategic_fit_summary)
-
-    if job.strategic_reasons:
-        print("\nWhy this role is strategically strong")
-        for reason in job.strategic_reasons:
+        print("\nWhy it was rejected")
+        for reason in reasons.get("risk", []) or []:
             print(f"- {reason}")
+        return
 
+    print(f"\nStructural Fit")
+    if job.structural_fit_summary:
+        print(job.structural_fit_summary)
+    else:
+        print("No structured fit summary available.")
+
+    print(f"\nStrategic Fit")
+    if job.strategic_fit_summary:
+        print(job.strategic_fit_summary)
+    else:
+        print("No strategic fit summary available.")
+
+    print(f"\nMain cautions")
     if job.caution_reasons:
-        print("\nMain gaps / cautions")
         for reason in job.caution_reasons:
             print(f"- {reason}")
+    else:
+        print("- None identified")
 
-    print("\nBreakdown")
-    print(f"- Role Fit: {breakdown.get('role_fit', 0)}/25")
-    print(f"- Tech Match: {breakdown.get('tech_match', 0)}/30")
-    print(f"- Location: {breakdown.get('location', 0)}/15")
-    print(f"- Company/Program: {breakdown.get('company_quality', 0)}/15")
-    print(f"- Growth: {breakdown.get('growth', 0)}/10")
-    print(f"- Risk: {breakdown.get('risk', 0)}/5")
-
-    print("\nActionable Gaps")
+    print(f"\nActionable Gaps")
     if job.missing_skills:
         for skill in job.missing_skills:
             print(f"- {skill}")
     else:
         print("- None identified")
 
-    print("\nFlags")
-    if flags:
-        for flag in flags:
-            print(f"- {flag}")
-    else:
-        print("- None")
-
-    print("\nWhy this scored the way it did")
-    for category_label, key in [
-        ("Role Fit", "role_fit"),
-        ("Tech Match", "tech_match"),
-        ("Location", "location"),
-        ("Company/Program", "company_quality"),
-        ("Growth", "growth"),
-        ("Risk", "risk"),
-    ]:
-        category_reasons = reasons.get(key, []) or []
-        print(f"{category_label}:")
-        if category_reasons:
-            for reason in category_reasons:
-                print(f"  - {reason}")
-        else:
-            print("  - No specific notes")
+    print("\nBreakdown")
+    print(
+        f"Role {breakdown.get('role_fit', 0)} | "
+        f"Tech {breakdown.get('tech_match', 0)} | "
+        f"Location {breakdown.get('location', 0)} | "
+        f"Company {breakdown.get('company_quality', 0)} | "
+        f"Growth {breakdown.get('growth', 0)} | "
+        f"Risk {breakdown.get('risk', 0)}"
+    )
 
     if verbose:
+        print("\nWhy this role is strategically strong")
+        if job.strategic_reasons:
+            for reason in job.strategic_reasons:
+                print(f"- {reason}")
+        else:
+            print("- No strategic reasons available")
+
+        print("\nFlags")
+        if flags:
+            for flag in flags:
+                print(f"- {flag}")
+        else:
+            print("- None")
+
+        print("\nWhy this scored the way it did")
+        for category_label, key in [
+            ("Role Fit", "role_fit"),
+            ("Tech Match", "tech_match"),
+            ("Location", "location"),
+            ("Company/Program", "company_quality"),
+            ("Growth", "growth"),
+            ("Risk", "risk"),
+        ]:
+            category_reasons = reasons.get(key, []) or []
+            print(f"{category_label}:")
+            if category_reasons:
+                for reason in category_reasons:
+                    print(f"  - {reason}")
+            else:
+                print("  - No specific notes")
+
         print("\nRaw extracted fields")
+        print(f"- Location: {location}")
+        print(f"- Work mode: {job.work_mode or 'Unknown'}")
+        print(f"- Role level: {job.role_level or 'Unknown'}")
+        print(f"- Program type: {job.program_type or 'Unknown'}")
+        print(f"- Contract type: {job.contract_type or 'Unknown'}")
         print(f"- Tech tools: {job.tech_tools}")
         print(f"- Tech domains: {job.tech_domains}")
         print(f"- Growth signals: {job.growth_signals}")
-        print(f"- Contract type: {job.contract_type}")
         print(f"- Clearance required: {job.clearance_required}")
         print(f"- Citizenship required: {job.citizenship_required}")
         print(f"- University restriction present: {job.university_restriction_present}")
