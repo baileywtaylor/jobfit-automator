@@ -27,7 +27,7 @@ from models import JobPosting
 
 logger = logging.getLogger("jobfit")
 
-SCHEMA_VERSION = "v8"
+SCHEMA_VERSION = "v11"
 AI_MODEL = "gpt-4.1-mini"
 
 
@@ -61,7 +61,7 @@ def hash_job(text: str) -> str:
     return hashlib.sha256((text + SCHEMA_VERSION).encode("utf-8")).hexdigest()
 
 
-def hash_eval(job_text: str, profile: Dict[str, Any]) -> str:
+def hash_eval(job_text: str, profile: Dict[str, Any], job: JobPosting | None = None) -> str:
     profile_fragment = json.dumps(
         {
             "preferred_locations": profile.get("target", {}).get("preferred_locations", []),
@@ -73,7 +73,44 @@ def hash_eval(job_text: str, profile: Dict[str, Any]) -> str:
         },
         sort_keys=True,
     )
-    return hashlib.sha256((job_text + profile_fragment + "eval_v2").encode("utf-8")).hexdigest()
+
+    extracted_fragment = {}
+    if job is not None:
+        extracted_fragment = {
+            "title": job.title,
+            "company": job.company,
+            "location": job.location,
+            "role_level": job.role_level,
+            "program_type": job.program_type,
+            "work_mode": job.work_mode,
+            "contract_type": job.contract_type,
+            "tech_tools": job.tech_tools,
+            "tech_domains": job.tech_domains,
+            "candidate_required_tools": job.candidate_required_tools,
+            "candidate_preferred_tools": job.candidate_preferred_tools,
+            "role_exposure_tools": job.role_exposure_tools,
+            "role_exposure_domains": job.role_exposure_domains,
+            "must_haves": job.must_haves,
+            "nice_to_haves": job.nice_to_haves,
+            "responsibilities": job.responsibilities,
+            "growth_signals": job.growth_signals,
+            "citizenship_required": job.citizenship_required,
+            "clearance_required": job.clearance_required,
+            "university_restriction_present": job.university_restriction_present,
+            "required_university": job.required_university,
+            "risk_flags": job.risk_flags,
+            "summary": job.summary,
+        }
+
+    return hashlib.sha256(
+        (
+            job_text
+            + profile_fragment
+            + json.dumps(extracted_fragment, sort_keys=True)
+            + SCHEMA_VERSION
+            + "eval_v3"
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def build_openai_client() -> OpenAI | None:
@@ -104,7 +141,7 @@ def apply_synonym_map(tokens: List[str], profile: Dict[str, Any]) -> List[str]:
 
     for token in tokens:
         clean = normalize_token(token)
-        mapped = synonym_map.get(clean, clean)
+        mapped = normalize_token(synonym_map.get(clean, clean))
         if mapped not in normalized:
             normalized.append(mapped)
 
@@ -125,6 +162,88 @@ def get_profile_skill_buckets(profile: Dict[str, Any]) -> Dict[str, set[str]]:
         "all": strong | working | basic,
     }
 
+def get_target_interest_tokens(profile: Dict[str, Any]) -> set[str]:
+    """
+    Build a set of normalized interest/domain tokens from the user's target profile.
+
+    This expands internal role-cluster labels like:
+    - software_engineering
+    - security_engineering
+    - cloud_platform
+
+    into real matching tokens such as:
+    - engineering
+    - cybersecurity
+    - cloud
+    """
+    target = profile.get("target", {}) or {}
+    clusters = target.get("preferred_role_clusters", {}) or {}
+    growth_prefs = target.get("growth_preferences", {}) or {}
+
+    tokens: set[str] = set()
+
+    cluster_expansions = {
+        "software engineering": {
+            "software engineering", "engineering", "software", "systems", "testing", "build"
+        },
+        "graduate software": {
+            "software engineering", "engineering", "software", "graduate software"
+        },
+        "automation engineering": {
+            "automation", "engineering", "systems", "testing"
+        },
+        "security engineering": {
+            "cybersecurity", "cyber security", "security", "cyber", "engineering"
+        },
+        "cyber rotation": {
+            "cybersecurity", "cyber security", "cyber", "security"
+        },
+        "cloud platform": {
+            "cloud", "cloud platforms", "platform", "platforms", "engineering"
+        },
+        "devops": {
+            "devops", "cloud", "automation", "platform", "engineering", "ci/cd"
+        },
+        "platform engineering": {
+            "platform", "platforms", "engineering", "cloud", "systems"
+        },
+        "security rotation": {
+            "cybersecurity", "cyber security", "cyber", "security"
+        },
+        "software rotation": {
+            "software engineering", "engineering", "software", "systems"
+        },
+    }
+
+    def add_value(value: str) -> None:
+        norm = normalize_token(value)
+        tokens.add(norm)
+
+        expanded = cluster_expansions.get(norm, set())
+        for item in expanded:
+            tokens.add(normalize_token(item))
+
+    for _, values in clusters.items():
+        if isinstance(values, list):
+            for value in values:
+                add_value(value)
+        elif isinstance(values, str):
+            add_value(values)
+
+    for _, values in growth_prefs.items():
+        if isinstance(values, list):
+            for value in values:
+                add_value(value)
+        elif isinstance(values, str):
+            add_value(values)
+
+    # Also include direct skill/domain signals from the profile itself
+    skills = profile.get("skills", {}) or {}
+    for bucket in ("strong", "working", "basic"):
+        for value in skills.get(bucket, []) or []:
+            add_value(value)
+
+    return tokens
 
 # -----------------------------
 # Deterministic scoring
@@ -206,106 +325,397 @@ def dedupe_preserve_order(items: List[str]) -> List[str]:
             out.append(item)
     return out
 
+def get_target_interest_tokens(profile: Dict[str, Any]) -> set[str]:
+    target = profile.get("target", {}) or {}
+    clusters = target.get("preferred_role_clusters", {}) or {}
+
+    tokens: set[str] = set()
+
+    for _, values in clusters.items():
+        if isinstance(values, list):
+            for value in values:
+                tokens.add(normalize_token(value))
+        elif isinstance(values, str):
+            tokens.add(normalize_token(values))
+
+    growth_prefs = target.get("growth_preferences", {}) or {}
+    for _, values in growth_prefs.items():
+        if isinstance(values, list):
+            for value in values:
+                tokens.add(normalize_token(value))
+        elif isinstance(values, str):
+            tokens.add(normalize_token(values))
+
+    company_prefs = target.get("company_preferences", {}) or {}
+    for _, values in company_prefs.items():
+        if isinstance(values, list):
+            for value in values:
+                tokens.add(normalize_token(value))
+        elif isinstance(values, str):
+            tokens.add(normalize_token(values))
+
+    return tokens
+
+def get_priority_domain_weights(profile: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Maps high-value target domains to stronger exposure weights.
+    These represent areas the candidate especially wants to build in.
+    """
+    return {
+        "cybersecurity": 3.2,
+        "cyber security": 3.2,
+        "cloud": 3.0,
+        "engineering": 2.8,
+        "software engineering": 2.8,
+        "technology strategy": 2.0,
+        "data": 2.2,
+        "data analysis": 2.0,
+        "machine learning": 2.2,
+        "ai": 2.4,
+        "digital transformation": 1.8,
+    }
+
 def score_tech_match(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str], List[str]]:
     """
-    Smarter tech scoring:
-    - languages/fundamentals matter most
-    - concrete tools/platforms matter next
-    - domains/exposure areas matter lightly
+    Tech Match scoring model:
+
+    Total: 30 points
+    - 10 points: prerequisite fit
+    - 20 points: exposure alignment / technical opportunity
+
+    Design intent:
+    - If a role has hard technical requirements the candidate does not meet,
+      prerequisite fit stays low and actionable gaps are surfaced.
+    - If a graduate role has little/no required tech but offers strong exposure
+      aligned with the candidate's interests, the tech score should still be high.
     """
     max_score = float(profile.get("weights", {}).get("tech_match", 30))
-    raw_tools = dedupe_preserve_order(apply_synonym_map(job.tech_tools or [], profile))
-    raw_domains = dedupe_preserve_order(apply_synonym_map(job.tech_domains or [], profile))
 
-    if not raw_tools and not raw_domains:
-        return round(max_score * 0.4, 1), ["No clear tech signals extracted; assigning conservative partial score"], []
+    # Internal split
+    prereq_max = 10.0
+    exposure_max = 20.0
+
+    required_tools = dedupe_preserve_order(
+        apply_synonym_map(job.candidate_required_tools or [], profile)
+    )
+    preferred_tools = dedupe_preserve_order(
+        apply_synonym_map(job.candidate_preferred_tools or [], profile)
+    )
+    exposure_tools = dedupe_preserve_order(
+        apply_synonym_map(job.role_exposure_tools or [], profile)
+    )
+    exposure_domains = dedupe_preserve_order(
+        apply_synonym_map(job.role_exposure_domains or [], profile)
+    )
+
+    # Backward-compatible fallback if the new fields are empty
+    if not required_tools and not preferred_tools and not exposure_tools and not exposure_domains:
+        legacy_tools = dedupe_preserve_order(apply_synonym_map(job.tech_tools or [], profile))
+        legacy_domains = dedupe_preserve_order(apply_synonym_map(job.tech_domains or [], profile))
+
+        if legacy_tools:
+            required_tools = legacy_tools
+        elif legacy_domains:
+            exposure_domains = legacy_domains
+        else:
+            return (
+                round(max_score * 0.4, 1),
+                ["No clear tech signals extracted; assigning conservative partial score"],
+                [],
+            )
 
     buckets = get_profile_skill_buckets(profile)
+    target_interest_tokens = get_target_interest_tokens(profile)
 
-    matched_languages: List[str] = []
-    matched_tools: List[str] = []
-    matched_domains: List[str] = []
-
-    missing_core: List[str] = []
-    missing_learnable: List[str] = []
-    missing_exposure: List[str] = []
-
-    score = 0.0
     reasons: List[str] = []
 
-    # Score tools/languages
-    for item in raw_tools:
+    matched_required_languages: List[str] = []
+    matched_required_tools: List[str] = []
+    matched_preferred: List[str] = []
+    matched_exposure_tools: List[str] = []
+    matched_exposure_domains: List[str] = []
+    matched_interest_exposure: List[str] = []
+
+    missing_required: List[str] = []
+    missing_preferred: List[str] = []
+
+    def bucket_strength(item: str) -> str | None:
+        if item in buckets["strong"]:
+            return "strong"
+        if item in buckets["working"]:
+            return "working"
+        if item in buckets["basic"]:
+            return "basic"
+        return None
+
+    def interest_match(item: str) -> bool:
+        item_n = normalize_token(item)
+
+        aliases = {
+            "cyber security": "cybersecurity",
+            "cloud platforms": "cloud",
+            "data analysis": "data",
+            "software engineering": "engineering",
+            "platform engineering": "engineering",
+        }
+        item_canonical = aliases.get(item_n, item_n)
+
+        if item_n in target_interest_tokens or item_canonical in target_interest_tokens:
+            return True
+
+        for tok in target_interest_tokens:
+            tok_canonical = aliases.get(tok, tok)
+            if (
+                tok in item_n
+                or item_n in tok
+                or tok_canonical in item_canonical
+                or item_canonical in tok_canonical
+            ):
+                return True
+
+        return False
+
+    def is_domain_like(item: str) -> bool:
+        return classify_tech_item(item) == "domain"
+    
+    aligned_exposure_concepts: List[str] = []
+
+    def add_aligned_exposure(item: str) -> None:
+        canonical = normalize_token(item)
+        aliases = {
+            "cyber security": "cybersecurity",
+            "cloud platforms": "cloud",
+            "data analysis": "data",
+            "software engineering": "engineering",
+            "digital platforms": "digital transformation",
+        }
+        canonical = aliases.get(canonical, canonical)
+
+        if canonical not in aligned_exposure_concepts:
+            aligned_exposure_concepts.append(canonical)
+
+    # Prevent obvious double-counting:
+    # if an exposure "tool" is really a domain and already exists in exposure_domains,
+    # keep it only in exposure_domains.
+    exposure_domain_set = set(exposure_domains)
+    filtered_exposure_tools: List[str] = []
+    for item in exposure_tools:
+        if is_domain_like(item) and item in exposure_domain_set:
+            continue
+        filtered_exposure_tools.append(item)
+    exposure_tools = filtered_exposure_tools
+
+    # -------------------------
+    # 1) PREREQUISITE FIT (10)
+    # -------------------------
+    prereq_score = 0.0
+
+    # Required tools: strongest signal
+    for item in required_tools:
         item_type = classify_tech_item(item)
-        in_strong = item in buckets["strong"]
-        in_working = item in buckets["working"]
-        in_basic = item in buckets["basic"]
+        strength = bucket_strength(item)
 
         if item_type == "language":
-            if in_strong:
-                score += 4.0
-                matched_languages.append(item)
-            elif in_working:
-                score += 3.0
-                matched_languages.append(item)
-            elif in_basic:
-                score += 2.0
-                matched_languages.append(item)
+            if strength == "strong":
+                prereq_score += 3.5
+                matched_required_languages.append(item)
+            elif strength == "working":
+                prereq_score += 2.8
+                matched_required_languages.append(item)
+            elif strength == "basic":
+                prereq_score += 1.8
+                matched_required_languages.append(item)
             else:
-                missing_core.append(item)
-
+                missing_required.append(item)
         else:
-            # treat everything else from tech_tools as a tool/platform
-            if in_strong:
-                score += 3.0
-                matched_tools.append(item)
-            elif in_working:
-                score += 2.2
-                matched_tools.append(item)
-            elif in_basic:
-                score += 1.4
-                matched_tools.append(item)
+            if strength == "strong":
+                prereq_score += 2.8
+                matched_required_tools.append(item)
+            elif strength == "working":
+                prereq_score += 2.2
+                matched_required_tools.append(item)
+            elif strength == "basic":
+                prereq_score += 1.4
+                matched_required_tools.append(item)
             else:
-                missing_learnable.append(item)
+                missing_required.append(item)
 
-    # Score domains separately — no reclassification
-    for item in raw_domains:
-        in_strong = item in buckets["strong"]
-        in_working = item in buckets["working"]
-        in_basic = item in buckets["basic"]
-        matched = in_strong or in_working or in_basic
+    # Preferred tools: softer signal
+    for item in preferred_tools:
+        strength = bucket_strength(item)
 
-        if matched:
-            score += 1.2
-            matched_domains.append(item)
+        if strength == "strong":
+            prereq_score += 1.4
+            matched_preferred.append(item)
+        elif strength == "working":
+            prereq_score += 1.0
+            matched_preferred.append(item)
+        elif strength == "basic":
+            prereq_score += 0.6
+            matched_preferred.append(item)
         else:
-            missing_exposure.append(item)
+            missing_preferred.append(item)
 
+    prereq_score = min(prereq_score, prereq_max)
+
+        # -------------------------
+    # 2) EXPOSURE ALIGNMENT (20)
+    # -------------------------
+    exposure_score = 0.0
+
+    unique_interest_exposure: List[str] = []
+    priority_weights = get_priority_domain_weights(profile)
+
+    def canonicalize_domain(item: str) -> str:
+        item_n = normalize_token(item)
+        aliases = {
+            "cyber security": "cybersecurity",
+            "cloud platforms": "cloud",
+            "data analysis": "data",
+            "software engineering": "engineering",
+        }
+        return aliases.get(item_n, item_n)
+
+    seen_exposure_concepts: set[str] = set()
+
+    # Exposure tools: meaningful upside, but less important than domains
+    for item in exposure_tools:
+        canonical = canonicalize_domain(item)
+        strength = bucket_strength(item)
+
+        if canonical in seen_exposure_concepts:
+            continue
+
+        item_points = 0.0
+        aligned = False
+
+        if strength == "strong":
+            item_points += 1.6
+            matched_exposure_tools.append(item)
+            aligned = True
+        elif strength == "working":
+            item_points += 1.3
+            matched_exposure_tools.append(item)
+            aligned = True
+        elif strength == "basic":
+            item_points += 0.9
+            matched_exposure_tools.append(item)
+            aligned = True
+
+        if interest_match(item):
+            item_points += 1.8
+            aligned = True
+
+        if canonical in priority_weights:
+            item_points += priority_weights[canonical] * 0.45
+            aligned = True
+
+        if aligned:
+            add_aligned_exposure(canonical)
+
+        if item_points > 0:
+            seen_exposure_concepts.add(canonical)
+
+        exposure_score += item_points
+
+    # Exposure domains: strongest signal for graduate-role attractiveness
+    for item in exposure_domains:
+            canonical = canonicalize_domain(item)
+
+            if canonical in seen_exposure_concepts:
+                continue
+
+            item_points = 0.0
+            strength = bucket_strength(item)
+            aligned = False
+
+            if strength is not None:
+                item_points += 1.2
+                matched_exposure_domains.append(item)
+                aligned = True
+
+            if interest_match(item):
+                item_points += 2.6
+                aligned = True
+
+            if canonical in priority_weights:
+                item_points += priority_weights[canonical]
+                aligned = True
+
+            if canonical in {"cybersecurity", "cloud", "engineering", "ai", "machine learning", "data"}:
+                item_points += 0.8
+                aligned = True
+
+            if aligned:
+                add_aligned_exposure(canonical)
+
+            if item_points > 0:
+                seen_exposure_concepts.add(canonical)
+
+            exposure_score += item_points
+
+    matched_interest_exposure = aligned_exposure_concepts
+
+    # Breadth bonus for grad roles with strong aligned exposure
+    aligned_exposure_count = len(seen_exposure_concepts)
     if job.role_level == "graduate" or job.program_type == "grad_program":
+        if aligned_exposure_count >= 6:
+            exposure_score += 3.5
+            reasons.append("Graduate-role bonus applied for broad high-value technical exposure")
+        elif aligned_exposure_count >= 4:
+            exposure_score += 2.5
+            reasons.append("Graduate-role bonus applied for strong aligned technical exposure")
+        elif aligned_exposure_count >= 2:
+            exposure_score += 1.5
+            reasons.append("Graduate-role bonus applied for some aligned technical exposure")
+
         if job.learning_environment == "strong":
-            score += min(len(missing_exposure) * 0.35, 2.0)
-            reasons.append("Graduate-role adjustment applied to broad exposure areas")
+            exposure_score += 2.0
+            reasons.append("Graduate-role adjustment applied for strong learning environment")
         elif job.learning_environment == "medium":
-            score += min(len(missing_exposure) * 0.2, 1.0)
-            reasons.append("Moderate graduate-role adjustment applied to broad exposure areas")
+            exposure_score += 1.0
+            reasons.append("Graduate-role adjustment applied for moderate learning environment")
 
-    score = min(round(score, 1), max_score)
+    exposure_score = min(exposure_score, exposure_max)
 
-    if matched_languages:
-        reasons.append(f"Language/fundamental matches: {', '.join(matched_languages)}")
-    if matched_tools:
-        reasons.append(f"Tool/platform matches: {', '.join(matched_tools)}")
-    if matched_domains:
-        reasons.append(f"Domain alignment: {', '.join(matched_domains)}")
-    if missing_core:
-        reasons.append(f"Core technical gaps: {', '.join(missing_core)}")
-    if missing_learnable:
-        reasons.append(f"Learnable tool gaps: {', '.join(missing_learnable)}")
-    if missing_exposure:
-        reasons.append(f"Exposure areas, not treated as hard gaps: {', '.join(missing_exposure)}")
+    total_score = min(round(prereq_score + exposure_score, 1), max_score)
 
-    missing_skills = missing_core + missing_learnable
-    return score, reasons, missing_skills
+    if matched_required_languages:
+        reasons.append(f"Required language matches: {', '.join(matched_required_languages)}")
+    if matched_required_tools:
+        reasons.append(f"Required tool matches: {', '.join(matched_required_tools)}")
+    if matched_preferred:
+        reasons.append(f"Preferred tool matches: {', '.join(matched_preferred)}")
+    if matched_interest_exposure:
+        reasons.append(
+            f"Exposure strongly aligned with target interests: {', '.join(matched_interest_exposure)}"
+        )
+    else:
+        if matched_exposure_tools:
+            reasons.append(f"Relevant exposure-tool overlap: {', '.join(matched_exposure_tools)}")
+        if matched_exposure_domains:
+            reasons.append(f"Relevant exposure-domain overlap: {', '.join(matched_exposure_domains)}")
+    if missing_required:
+        reasons.append(f"Actionable required gaps: {', '.join(missing_required)}")
+    if missing_preferred:
+        reasons.append(f"Preferred but non-blocking gaps: {', '.join(missing_preferred)}")
+    if exposure_tools and not matched_exposure_tools and not any(interest_match(x) for x in exposure_tools):
+        reasons.append(
+            f"Role exposure tools present but not treated as gaps: {', '.join(exposure_tools)}"
+        )
+    if exposure_domains and not matched_exposure_domains and not any(interest_match(x) for x in exposure_domains):
+        reasons.append(
+            f"Role exposure domains present but not treated as gaps: {', '.join(exposure_domains)}"
+        )
 
+    reasons.append(
+        f"Tech scoring split: prerequisite fit {round(prereq_score, 1)}/{int(prereq_max)}, "
+        f"exposure alignment {round(exposure_score, 1)}/{int(exposure_max)}"
+    )
+
+    # Only required tools are actionable gaps.
+    missing_skills = missing_required
+    return total_score, reasons, missing_skills
 
 def score_location_fit(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str]]:
     rules = profile.get("scoring_rules", {}).get("location", {}) or {}
@@ -527,15 +937,23 @@ def check_profile_eligibility(job: JobPosting, profile: Dict[str, Any]) -> tuple
     flags: List[str] = []
 
     if job.university_restriction_present:
-        if university_matches_profile(job.required_university, profile):
-            reasons.append("University restriction satisfied: role requires UTS and profile matches")
-            return True, reasons, flags
+        required_university = (job.required_university or "").strip()
 
-        required_display = job.required_university or "another university"
-        current_display = profile.get("eligibility", {}).get("current_university", "unknown")
-        flags.append(f"Ineligible: role restricted to {required_display}, profile is {current_display}")
-        reasons.append("University-specific eligibility restriction does not match profile")
-        return False, reasons, flags
+        # Only hard-block if a specific university was actually extracted
+        if required_university:
+            if university_matches_profile(required_university, profile):
+                reasons.append("University restriction satisfied: role requires UTS and profile matches")
+                return True, reasons, flags
+
+            current_display = profile.get("eligibility", {}).get("current_university", "unknown")
+            flags.append(f"Ineligible: role restricted to {required_university}, profile is {current_display}")
+            reasons.append("University-specific eligibility restriction does not match profile")
+            return False, reasons, flags
+
+        # Restriction flag was raised but no university could be identified.
+        # Do NOT hard block; treat as uncertain and allow normal scoring.
+        reasons.append("University restriction signal detected but no specific university could be resolved")
+        return True, reasons, flags
 
     return True, reasons, flags
 
@@ -636,6 +1054,10 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
             },
             "tech_tools": {"type": "array", "items": {"type": "string"}},
             "tech_domains": {"type": "array", "items": {"type": "string"}},
+            "candidate_required_tools": {"type": "array", "items": {"type": "string"}},
+            "candidate_preferred_tools": {"type": "array", "items": {"type": "string"}},
+            "role_exposure_tools": {"type": "array", "items": {"type": "string"}},
+            "role_exposure_domains": {"type": "array", "items": {"type": "string"}},
             "must_haves": {"type": "array", "items": {"type": "string"}},
             "nice_to_haves": {"type": "array", "items": {"type": "string"}},
             "responsibilities": {"type": "array", "items": {"type": "string"}},
@@ -655,6 +1077,10 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
                     "contract_type": {"type": "array", "items": {"type": "string"}},
                     "tech_tools": {"type": "array", "items": {"type": "string"}},
                     "tech_domains": {"type": "array", "items": {"type": "string"}},
+                    "candidate_required_tools": {"type": "array", "items": {"type": "string"}},
+                    "candidate_preferred_tools": {"type": "array", "items": {"type": "string"}},
+                    "role_exposure_tools": {"type": "array", "items": {"type": "string"}},
+                    "role_exposure_domains": {"type": "array", "items": {"type": "string"}},
                     "growth_signals": {"type": "array", "items": {"type": "string"}},
                     "citizenship_required": {"type": "array", "items": {"type": "string"}},
                     "clearance_required": {"type": "array", "items": {"type": "string"}},
@@ -668,7 +1094,11 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
                     "work_mode",
                     "contract_type",
                     "tech_tools",
-                    "tech_domains", 
+                    "tech_domains",
+                    "candidate_required_tools",
+                    "candidate_preferred_tools",
+                    "role_exposure_tools",
+                    "role_exposure_domains",
                     "growth_signals",
                     "citizenship_required",
                     "clearance_required",
@@ -689,6 +1119,10 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
             "contract_type",
             "tech_tools",
             "tech_domains",
+            "candidate_required_tools",
+            "candidate_preferred_tools",
+            "role_exposure_tools",
+            "role_exposure_domains",
             "must_haves",
             "nice_to_haves",
             "responsibilities",
@@ -713,10 +1147,16 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
         "- work_mode must be one of: onsite, hybrid, remote, unknown.\n"
         "- contract_type must be one of: permanent, contract, internship, unknown.\n"
         "- If role_level, program_type, work_mode, or contract_type cannot be determined, return unknown.\n"
-        "- tech_tools should include concrete programming languages, frameworks, cloud platforms, products, services, and software tools explicitly mentioned or clearly implied. Examples: python, c++, c#, java, blueprism, selenium, azure, google cloud.\n"
-        "- tech_domains should include broader technical areas or capability domains such as ai, machine learning, cloud, automation, analytics, cybersecurity, devops.\n"
-        "- If a job says experience with any of several programming languages, include each explicitly listed language in tech_tools.\n"
-        "- Programming languages must go in tech_tools, not tech_domains.\n"
+        "- tech_tools should include all concrete programming languages, frameworks, cloud platforms, products, services, and software tools explicitly mentioned anywhere in the ad.\n"
+        "- tech_domains should include all broader technical areas or capability domains explicitly mentioned anywhere in the ad, such as ai, machine learning, cloud, automation, analytics, cybersecurity, devops.\n"
+        "- candidate_required_tools should include only technologies the candidate is explicitly required or expected to already know before applying.\n"
+        "- candidate_preferred_tools should include only technologies listed as preferred, desirable, advantageous, or nice-to-have.\n"
+        "- role_exposure_tools should include concrete tools/platforms the candidate would work with or learn in the role, but which are not clearly stated as prerequisites.\n"
+        "- role_exposure_domains should include broader areas the role touches, such as ai, cloud, automation, analytics, cybersecurity, or machine learning, when they describe the work, team, projects, or learning exposure rather than applicant prerequisites.\n"
+        "- Do not place a technology in candidate_required_tools unless the ad clearly frames it as a requirement, prior experience expectation, applicant skill, qualification, or selection criterion.\n"
+        "- Do not place a technology in candidate_preferred_tools unless the ad clearly frames it as preferred, desirable, advantageous, or nice-to-have.\n"
+        "- If a technology is only mentioned in duties, project descriptions, team context, rotation descriptions, or what the candidate will work on after joining, place it in role_exposure_tools or role_exposure_domains instead.\n"
+        "- Programming languages must go in tech_tools, and may also appear in candidate_required_tools or candidate_preferred_tools if the ad explicitly frames them that way.\n"
         "- tech_tools must only include concrete technologies, languages, frameworks, products, cloud platforms, services, or software tools.\n"
         "- tech_domains must include broader concepts, capability areas, and methods such as automation, ai, machine learning, analytics, forecasting, time series forecasting, natural language processing, and optical character recognition.\n"
         "- Do not place conceptual areas or methods like time series forecasting into tech_tools.\n"
@@ -730,6 +1170,7 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
         "- required_university should be the university name as written in the ad when such a restriction exists, otherwise null.\n"
         "- If the job says it is only open to students or graduates of a specific university, extract that university into required_university.\n"
         "- Do not normalize required_university to a code; keep the university name close to the wording in the ad.\n"
+        "- Do not set university_restriction_present to true merely because the ad lists suitable degrees or fields of study; only set it to true if applicants are explicitly limited to a named university.\n"
         "- risk_flags should only include objective concerns explicitly supported by the ad.\n"
         "- evidence should contain short supporting snippets from the ad.\n"
         "- summary should be 1-3 sentences.\n"
@@ -768,7 +1209,7 @@ def evaluate_job_with_ai(
     profile: Dict[str, Any],
     cache_dir: Path,
 ) -> Dict[str, Any]:
-    cache_file = cache_dir / f"{hash_eval(job.raw_text, profile)}.eval.json"
+    cache_file = cache_dir / f"{hash_eval(job.raw_text, profile, job)}.eval.json"
 
     if cache_file.exists():
         try:
@@ -871,6 +1312,10 @@ def evaluate_job_with_ai(
         "contract_type": job.contract_type,
         "tech_tools": job.tech_tools,
         "tech_domains": job.tech_domains,
+        "candidate_required_tools": job.candidate_required_tools,
+        "candidate_preferred_tools": job.candidate_preferred_tools,
+        "role_exposure_tools": job.role_exposure_tools,
+        "role_exposure_domains": job.role_exposure_domains,
         "must_haves": job.must_haves,
         "nice_to_haves": job.nice_to_haves,
         "responsibilities": job.responsibilities,
@@ -953,6 +1398,10 @@ def enrich_jobs_with_ai(
             job.work_mode = ai_data.get("work_mode")
             job.tech_tools = ai_data.get("tech_tools", []) or []
             job.tech_domains = ai_data.get("tech_domains", []) or []
+            job.candidate_required_tools = ai_data.get("candidate_required_tools", []) or []
+            job.candidate_preferred_tools = ai_data.get("candidate_preferred_tools", []) or []
+            job.role_exposure_tools = ai_data.get("role_exposure_tools", []) or []
+            job.role_exposure_domains = ai_data.get("role_exposure_domains", []) or []
             job.growth_signals = ai_data.get("growth_signals", []) or []
             job.citizenship_required = ai_data.get("citizenship_required")
             job.clearance_required = ai_data.get("clearance_required")
@@ -1011,7 +1460,7 @@ def write_results_md(
         title = job.title or job.filename.replace(".txt", "")
         company = job.company or "Unknown"
         location = job.location or "Unknown"
-        breakdown = job.score_breakdown or {}
+        breakdown = result.get("score_breakdown") or {}
         flags = result.get("flags") or []
         reasons = result.get("reasons") or {}
         missing_skills = job.missing_skills or []
@@ -1136,9 +1585,9 @@ def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> 
     title = job.title or job.filename.replace(".txt", "")
     company = job.company or "Unknown"
     location = job.location or "Unknown"
-    breakdown = job.score_breakdown or {}
+    breakdown = result.get("score_breakdown") or {}
     flags = result.get("flags") or []
-    reasons = result.get("reasons") or []
+    reasons = result.get("reasons") or {}
 
     print(f"\nJob: {title} — {company}")
     print(f"Score: {job.score}/100")
@@ -1231,6 +1680,10 @@ def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> 
         print(f"- Contract type: {job.contract_type or 'Unknown'}")
         print(f"- Tech tools: {job.tech_tools}")
         print(f"- Tech domains: {job.tech_domains}")
+        print(f"- Candidate required tools: {job.candidate_required_tools}")
+        print(f"- Candidate preferred tools: {job.candidate_preferred_tools}")
+        print(f"- Role exposure tools: {job.role_exposure_tools}")
+        print(f"- Role exposure domains: {job.role_exposure_domains}")
         print(f"- Growth signals: {job.growth_signals}")
         print(f"- Clearance required: {job.clearance_required}")
         print(f"- Citizenship required: {job.citizenship_required}")

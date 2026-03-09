@@ -47,6 +47,10 @@ class JobPosting(BaseModel):
     # Technology stack
     tech_tools: List[str] = Field(default_factory=list)
     tech_domains: List[str] = Field(default_factory=list)
+    candidate_required_tools: List[str] = Field(default_factory=list)
+    candidate_preferred_tools: List[str] = Field(default_factory=list)
+    role_exposure_tools: List[str] = Field(default_factory=list)
+    role_exposure_domains: List[str] = Field(default_factory=list)
 
     # Growth / learning signals
     growth_signals: List[str] = Field(default_factory=list)
