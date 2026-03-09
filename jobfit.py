@@ -27,7 +27,7 @@ from models import JobPosting
 
 logger = logging.getLogger("jobfit")
 
-SCHEMA_VERSION = "v4"
+SCHEMA_VERSION = "v8"
 AI_MODEL = "gpt-4.1-mini"
 
 
@@ -70,7 +70,6 @@ def hash_eval(job_text: str, profile: Dict[str, Any]) -> str:
             "preferred_role_clusters": profile.get("target", {}).get("preferred_role_clusters", {}),
             "company_preferences": profile.get("target", {}).get("company_preferences", {}),
             "growth_preferences": profile.get("target", {}).get("growth_preferences", {}),
-            "eligibility": profile.get("target", {}).get("eligibility", {}),
         },
         sort_keys=True,
     )
@@ -144,61 +143,204 @@ def score_role_fit(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, Lis
 
     return min(round(score, 1), max_score), reasons
 
+def classify_tech_item(token: str) -> str:
+    """
+    Classify a normalized tech token into:
+    - language
+    - tool
+    - domain
+    - unknown
+    """
+    t = normalize_token(token)
+
+    language_keywords = {
+        "python", "java", "c#", "csharp", "cpp", "c++", "javascript",
+        "typescript", "sql", "go", "rust", "php", "ruby"
+    }
+
+    tool_keywords = {
+        "aws", "azure", "google cloud", "gcp", "docker", "kubernetes",
+        "terraform", "react", "node", "node.js", "git", "ci/cd",
+        "selenium", "blueprism", "blue prism", "uipath", "robocorp",
+        "power bi", "tableau", "snowflake", "databricks", "postgres",
+        "mysql", "mongodb", "linux", "openai api", "rest api"
+    }
+
+    domain_keywords = {
+        "artificial intelligence", "ai", "machine learning",
+        "generative ai", "natural language processing", "nlp",
+        "optical character recognition", "ocr", "data analytics",
+        "data science", "cloud", "cyber security", "cybersecurity",
+        "automation", "digital transformation", "software engineering",
+        "process improvement", "robotic process automation", "rpa",
+        "time series forecasting", "forecasting"
+    }
+
+    if t in language_keywords:
+        return "language"
+    if t in tool_keywords:
+        return "tool"
+    if t in domain_keywords:
+        return "domain"
+
+    if any(x in t for x in ["language", "programming"]):
+        return "language"
+    if any(x in t for x in [
+        "cloud", "ai", "machine learning", "analytics", "automation",
+        "security", "transformation", "forecasting", "natural language",
+        "optical character"
+    ]):
+        return "domain"
+    if any(x in t for x in ["api", "platform", "framework", "tool", "prism", "uipath", "selenium", "azure", "google cloud"]):
+        return "tool"
+
+    return "unknown"
+
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 def score_tech_match(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str], List[str]]:
     """
-    Current tech scoring remains mostly skill-match based.
-    This is intentionally left simpler for now; the next major iteration
-    should split tools vs domains vs methods.
+    Smarter tech scoring:
+    - languages/fundamentals matter most
+    - concrete tools/platforms matter next
+    - domains/exposure areas matter lightly
     """
     max_score = float(profile.get("weights", {}).get("tech_match", 30))
-    job_stack = apply_synonym_map(job.tech_stack or [], profile)
+    raw_tools = dedupe_preserve_order(apply_synonym_map(job.tech_tools or [], profile))
+    raw_domains = dedupe_preserve_order(apply_synonym_map(job.tech_domains or [], profile))
 
-    if not job_stack:
-        return round(max_score * 0.35, 1), ["No clear tech stack extracted; assigning conservative partial score"], []
+    if not raw_tools and not raw_domains:
+        return round(max_score * 0.4, 1), ["No clear tech signals extracted; assigning conservative partial score"], []
 
     buckets = get_profile_skill_buckets(profile)
 
-    strong_hits = [t for t in job_stack if t in buckets["strong"]]
-    working_hits = [t for t in job_stack if t in buckets["working"]]
-    basic_hits = [t for t in job_stack if t in buckets["basic"]]
-    missing = [t for t in job_stack if t not in buckets["all"]]
+    matched_languages: List[str] = []
+    matched_tools: List[str] = []
+    matched_domains: List[str] = []
 
-    matched_points = (
-        len(strong_hits) * 1.0
-        + len(working_hits) * 0.7
-        + len(basic_hits) * 0.4
-    )
-    possible_points = max(len(job_stack), 1)
-    ratio = min(matched_points / possible_points, 1.0)
-    score = round(max_score * ratio, 1)
+    missing_core: List[str] = []
+    missing_learnable: List[str] = []
+    missing_exposure: List[str] = []
 
+    score = 0.0
     reasons: List[str] = []
-    if strong_hits:
-        reasons.append(f"Strong matches: {', '.join(strong_hits)}")
-    if working_hits:
-        reasons.append(f"Working matches: {', '.join(working_hits)}")
-    if basic_hits:
-        reasons.append(f"Basic matches: {', '.join(basic_hits)}")
-    if missing:
-        reasons.append(f"Missing extracted skills: {', '.join(missing)}")
 
-    return score, reasons, missing
+    # Score tools/languages
+    for item in raw_tools:
+        item_type = classify_tech_item(item)
+        in_strong = item in buckets["strong"]
+        in_working = item in buckets["working"]
+        in_basic = item in buckets["basic"]
+
+        if item_type == "language":
+            if in_strong:
+                score += 4.0
+                matched_languages.append(item)
+            elif in_working:
+                score += 3.0
+                matched_languages.append(item)
+            elif in_basic:
+                score += 2.0
+                matched_languages.append(item)
+            else:
+                missing_core.append(item)
+
+        else:
+            # treat everything else from tech_tools as a tool/platform
+            if in_strong:
+                score += 3.0
+                matched_tools.append(item)
+            elif in_working:
+                score += 2.2
+                matched_tools.append(item)
+            elif in_basic:
+                score += 1.4
+                matched_tools.append(item)
+            else:
+                missing_learnable.append(item)
+
+    # Score domains separately — no reclassification
+    for item in raw_domains:
+        in_strong = item in buckets["strong"]
+        in_working = item in buckets["working"]
+        in_basic = item in buckets["basic"]
+        matched = in_strong or in_working or in_basic
+
+        if matched:
+            score += 1.2
+            matched_domains.append(item)
+        else:
+            missing_exposure.append(item)
+
+    if job.role_level == "graduate" or job.program_type == "grad_program":
+        if job.learning_environment == "strong":
+            score += min(len(missing_exposure) * 0.35, 2.0)
+            reasons.append("Graduate-role adjustment applied to broad exposure areas")
+        elif job.learning_environment == "medium":
+            score += min(len(missing_exposure) * 0.2, 1.0)
+            reasons.append("Moderate graduate-role adjustment applied to broad exposure areas")
+
+    score = min(round(score, 1), max_score)
+
+    if matched_languages:
+        reasons.append(f"Language/fundamental matches: {', '.join(matched_languages)}")
+    if matched_tools:
+        reasons.append(f"Tool/platform matches: {', '.join(matched_tools)}")
+    if matched_domains:
+        reasons.append(f"Domain alignment: {', '.join(matched_domains)}")
+    if missing_core:
+        reasons.append(f"Core technical gaps: {', '.join(missing_core)}")
+    if missing_learnable:
+        reasons.append(f"Learnable tool gaps: {', '.join(missing_learnable)}")
+    if missing_exposure:
+        reasons.append(f"Exposure areas, not treated as hard gaps: {', '.join(missing_exposure)}")
+
+    missing_skills = missing_core + missing_learnable
+    return score, reasons, missing_skills
 
 
 def score_location_fit(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[str]]:
     rules = profile.get("scoring_rules", {}).get("location", {}) or {}
+
     location_text = normalize(job.location or "")
+    company_text = normalize(job.company or "")
+    raw_text = normalize(job.raw_text or "")
     work_mode = (job.work_mode or "unknown").lower()
 
-    if "sydney" in location_text and work_mode == "hybrid":
-        return float(rules.get("hybrid_sydney", 15)), ["Hybrid Sydney role"]
+    # Explicit Sydney mention
     if "sydney" in location_text:
+        if work_mode == "hybrid":
+            return float(rules.get("hybrid_sydney", 15)), ["Hybrid Sydney role"]
         return float(rules.get("sydney", 15)), ["Sydney-based role"]
+
+    # Infer Sydney from employer / job text
+    inferred_sydney_signals = [
+        "university of sydney",
+        "usyd",
+        "sydney campus",
+    ]
+
+    if any(signal in company_text for signal in inferred_sydney_signals) or any(
+        signal in raw_text for signal in inferred_sydney_signals
+    ):
+        if work_mode == "hybrid":
+            return float(rules.get("hybrid_sydney", 15)), ["Inferred Sydney location from employer/job context"]
+        return float(rules.get("sydney", 15)), ["Inferred Sydney location from employer/job context"]
+
     if work_mode == "remote":
         return float(rules.get("remote", 14)), ["Remote role"]
+
     if work_mode == "hybrid":
         return float(rules.get("australia_other_hybrid", 10)), ["Hybrid role outside Sydney or unspecified city"]
+
     if work_mode == "onsite":
         return float(rules.get("australia_other_onsite", 6)), ["Onsite role outside Sydney or unspecified city"]
 
@@ -352,8 +494,75 @@ def score_risk(job: JobPosting, profile: Dict[str, Any]) -> tuple[float, List[st
 
     return max(round(score, 1), 0.0), reasons, flags
 
+def university_matches_profile(required_university: str | None, profile: Dict[str, Any]) -> bool:
+    """
+    Compare extracted university restriction against the user's university.
+    Only needs to recognize UTS aliases for now.
+    """
+    if not required_university:
+        return False
+
+    required = normalize(required_university)
+    current_university = normalize(profile.get("eligibility", {}).get("current_university", ""))
+
+    if current_university != "uts":
+        return False
+
+    uts_aliases = {
+        "uts",
+        "university of technology sydney",
+    }
+
+    return required in uts_aliases
+
+
+def check_profile_eligibility(job: JobPosting, profile: Dict[str, Any]) -> tuple[bool, List[str], List[str]]:
+    """
+    Returns:
+    - eligible: bool
+    - reasons: explanatory notes
+    - flags: blocking flags if any
+    """
+    reasons: List[str] = []
+    flags: List[str] = []
+
+    if job.university_restriction_present:
+        if university_matches_profile(job.required_university, profile):
+            reasons.append("University restriction satisfied: role requires UTS and profile matches")
+            return True, reasons, flags
+
+        required_display = job.required_university or "another university"
+        current_display = profile.get("eligibility", {}).get("current_university", "unknown")
+        flags.append(f"Ineligible: role restricted to {required_display}, profile is {current_display}")
+        reasons.append("University-specific eligibility restriction does not match profile")
+        return False, reasons, flags
+
+    return True, reasons, flags
 
 def score_job_hybrid(job: JobPosting, profile: Dict[str, Any]) -> Dict[str, Any]:
+    eligible, eligibility_reasons, eligibility_flags = check_profile_eligibility(job, profile)
+    if not eligible:
+        return {
+            "score": 0.0,
+            "score_breakdown": {
+                "role_fit": 0.0,
+                "tech_match": 0.0,
+                "location": 0.0,
+                "company_quality": 0.0,
+                "growth": 0.0,
+                "risk": 0.0,
+            },
+            "missing_skills": [],
+            "flags": eligibility_flags,
+            "reasons": {
+                "role_fit": [],
+                "tech_match": [],
+                "location": [],
+                "company_quality": [],
+                "growth": [],
+                "risk": eligibility_reasons,
+            },
+        }
     role_score, role_reasons = score_role_fit(job, profile)
     tech_score, tech_reasons, missing_skills = score_tech_match(job, profile)
     location_score, location_reasons = score_location_fit(job, profile)
@@ -425,13 +634,16 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
                 "type": ["string", "null"],
                 "enum": ["permanent", "contract", "internship", "unknown", None],
             },
-            "tech_stack": {"type": "array", "items": {"type": "string"}},
+            "tech_tools": {"type": "array", "items": {"type": "string"}},
+            "tech_domains": {"type": "array", "items": {"type": "string"}},
             "must_haves": {"type": "array", "items": {"type": "string"}},
             "nice_to_haves": {"type": "array", "items": {"type": "string"}},
             "responsibilities": {"type": "array", "items": {"type": "string"}},
             "growth_signals": {"type": "array", "items": {"type": "string"}},
             "citizenship_required": {"type": ["boolean", "null"]},
             "clearance_required": {"type": ["boolean", "null"]},
+            "university_restriction_present": {"type": ["boolean", "null"]},
+            "required_university": {"type": ["string", "null"]},
             "risk_flags": {"type": "array", "items": {"type": "string"}},
             "evidence": {
                 "type": ["object", "null"],
@@ -441,10 +653,13 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
                     "program_type": {"type": "array", "items": {"type": "string"}},
                     "work_mode": {"type": "array", "items": {"type": "string"}},
                     "contract_type": {"type": "array", "items": {"type": "string"}},
-                    "tech_stack": {"type": "array", "items": {"type": "string"}},
+                    "tech_tools": {"type": "array", "items": {"type": "string"}},
+                    "tech_domains": {"type": "array", "items": {"type": "string"}},
                     "growth_signals": {"type": "array", "items": {"type": "string"}},
                     "citizenship_required": {"type": "array", "items": {"type": "string"}},
                     "clearance_required": {"type": "array", "items": {"type": "string"}},
+                    "university_restriction_present": {"type": "array", "items": {"type": "string"}},
+                    "required_university": {"type": "array", "items": {"type": "string"}},
                     "risk_flags": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": [
@@ -452,10 +667,13 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
                     "program_type",
                     "work_mode",
                     "contract_type",
-                    "tech_stack",
+                    "tech_tools",
+                    "tech_domains", 
                     "growth_signals",
                     "citizenship_required",
                     "clearance_required",
+                    "university_restriction_present",
+                    "required_university",
                     "risk_flags",
                 ],
             },
@@ -469,13 +687,16 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
             "program_type",
             "work_mode",
             "contract_type",
-            "tech_stack",
+            "tech_tools",
+            "tech_domains",
             "must_haves",
             "nice_to_haves",
             "responsibilities",
             "growth_signals",
             "citizenship_required",
             "clearance_required",
+            "university_restriction_present",
+            "required_university",
             "risk_flags",
             "evidence",
             "summary",
@@ -492,13 +713,23 @@ def extract_job_with_ai(client: OpenAI, job: JobPosting, cache_dir: Path) -> Dic
         "- work_mode must be one of: onsite, hybrid, remote, unknown.\n"
         "- contract_type must be one of: permanent, contract, internship, unknown.\n"
         "- If role_level, program_type, work_mode, or contract_type cannot be determined, return unknown.\n"
-        "- tech_stack should be a normalized list of technologies/tools explicitly mentioned or clearly implied.\n"
+        "- tech_tools should include concrete programming languages, frameworks, cloud platforms, products, services, and software tools explicitly mentioned or clearly implied. Examples: python, c++, c#, java, blueprism, selenium, azure, google cloud.\n"
+        "- tech_domains should include broader technical areas or capability domains such as ai, machine learning, cloud, automation, analytics, cybersecurity, devops.\n"
+        "- If a job says experience with any of several programming languages, include each explicitly listed language in tech_tools.\n"
+        "- Programming languages must go in tech_tools, not tech_domains.\n"
+        "- tech_tools must only include concrete technologies, languages, frameworks, products, cloud platforms, services, or software tools.\n"
+        "- tech_domains must include broader concepts, capability areas, and methods such as automation, ai, machine learning, analytics, forecasting, time series forecasting, natural language processing, and optical character recognition.\n"
+        "- Do not place conceptual areas or methods like time series forecasting into tech_tools.\n"
         "- Normalize technologies to short canonical names where reasonable.\n"
         "- must_haves and nice_to_haves should be short skill phrases.\n"
         "- responsibilities should be concise bullet-like strings.\n"
         "- growth_signals should include only clear development signals such as mentorship, rotations, training, certifications, coaching, career progression.\n"
         "- citizenship_required should be true only if explicitly required.\n"
         "- clearance_required should be true only if explicitly required.\n"
+        "- university_restriction_present should be true only if the role explicitly restricts applicants to students or graduates of a named university.\n"
+        "- required_university should be the university name as written in the ad when such a restriction exists, otherwise null.\n"
+        "- If the job says it is only open to students or graduates of a specific university, extract that university into required_university.\n"
+        "- Do not normalize required_university to a code; keep the university name close to the wording in the ad.\n"
         "- risk_flags should only include objective concerns explicitly supported by the ad.\n"
         "- evidence should contain short supporting snippets from the ad.\n"
         "- summary should be 1-3 sentences.\n"
@@ -627,7 +858,7 @@ def evaluate_job_with_ai(
         "preferred_role_clusters": profile.get("target", {}).get("preferred_role_clusters", {}),
         "company_preferences": profile.get("target", {}).get("company_preferences", {}),
         "growth_preferences": profile.get("target", {}).get("growth_preferences", {}),
-        "eligibility": profile.get("target", {}).get("eligibility", {}),
+        "eligibility": profile.get("eligibility", {}),
     }
 
     extracted_context = {
@@ -638,13 +869,16 @@ def evaluate_job_with_ai(
         "program_type": job.program_type,
         "work_mode": job.work_mode,
         "contract_type": job.contract_type,
-        "tech_stack": job.tech_stack,
+        "tech_tools": job.tech_tools,
+        "tech_domains": job.tech_domains,
         "must_haves": job.must_haves,
         "nice_to_haves": job.nice_to_haves,
         "responsibilities": job.responsibilities,
         "growth_signals": job.growth_signals,
         "citizenship_required": job.citizenship_required,
         "clearance_required": job.clearance_required,
+        "university_restriction_present": job.university_restriction_present,
+        "required_university": job.required_university,
         "risk_flags": job.risk_flags,
         "summary": job.summary,
     }
@@ -717,10 +951,13 @@ def enrich_jobs_with_ai(
             job.role_level = ai_data.get("role_level")
             job.program_type = ai_data.get("program_type")
             job.work_mode = ai_data.get("work_mode")
-            job.tech_stack = ai_data.get("tech_stack", []) or []
+            job.tech_tools = ai_data.get("tech_tools", []) or []
+            job.tech_domains = ai_data.get("tech_domains", []) or []
             job.growth_signals = ai_data.get("growth_signals", []) or []
             job.citizenship_required = ai_data.get("citizenship_required")
             job.clearance_required = ai_data.get("clearance_required")
+            job.university_restriction_present = ai_data.get("university_restriction_present")
+            job.required_university = ai_data.get("required_university")
             job.contract_type = ai_data.get("contract_type")
             job.risk_flags = ai_data.get("risk_flags", []) or []
             job.evidence = ai_data.get("evidence")
@@ -782,6 +1019,12 @@ def write_results_md(
         lines.append(f"## {idx}) {title} — {company}")
         lines.append(f"**Score:** {job.score}/100")
         lines.append(f"**Recommendation:** {recommendation_label(job.recommendation)}")
+        ineligible_flags = [flag for flag in flags if flag.lower().startswith("ineligible:")]
+        if ineligible_flags:
+            lines.append("### Eligibility Issue")
+            for flag in ineligible_flags:
+                lines.append(f"- {flag}")
+            lines.append("")
         lines.append(f"**Location:** {location}")
         lines.append(f"**Work mode:** {job.work_mode or 'Unknown'}")
         lines.append(f"**Role level:** {job.role_level or 'Unknown'}")
@@ -820,7 +1063,7 @@ def write_results_md(
         lines.append(f"- Risk: {breakdown.get('risk', 0)}/5")
         lines.append("")
 
-        lines.append("### Missing Skills")
+        lines.append("### Actionable Gaps")
         if missing_skills:
             for skill in missing_skills:
                 lines.append(f"- {skill}")
@@ -900,6 +1143,13 @@ def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> 
     print(f"\nJob: {title} — {company}")
     print(f"Score: {job.score}/100")
     print(f"Recommendation: {recommendation_label(job.recommendation)}")
+
+    ineligible_flags = [flag for flag in flags if flag.lower().startswith("ineligible:")]
+    if ineligible_flags:
+        print("\nEligibility issue")
+        for flag in ineligible_flags:
+            print(f"- {flag}")
+
     print(f"Location: {location}")
     print(f"Work mode: {job.work_mode or 'Unknown'}")
     print(f"Role level: {job.role_level or 'Unknown'}")
@@ -931,7 +1181,7 @@ def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> 
     print(f"- Growth: {breakdown.get('growth', 0)}/10")
     print(f"- Risk: {breakdown.get('risk', 0)}/5")
 
-    print("\nMissing Skills")
+    print("\nActionable Gaps")
     if job.missing_skills:
         for skill in job.missing_skills:
             print(f"- {skill}")
@@ -964,11 +1214,14 @@ def print_job_result(job: JobPosting, result: Dict[str, Any], verbose: bool) -> 
 
     if verbose:
         print("\nRaw extracted fields")
-        print(f"- Tech stack: {job.tech_stack}")
+        print(f"- Tech tools: {job.tech_tools}")
+        print(f"- Tech domains: {job.tech_domains}")
         print(f"- Growth signals: {job.growth_signals}")
         print(f"- Contract type: {job.contract_type}")
         print(f"- Clearance required: {job.clearance_required}")
         print(f"- Citizenship required: {job.citizenship_required}")
+        print(f"- University restriction present: {job.university_restriction_present}")
+        print(f"- Required university: {job.required_university}")
         print(f"- AI evidence: {job.ai_evaluation_evidence}")
 
 
@@ -1001,6 +1254,8 @@ def main() -> None:
     scored: List[Tuple[JobPosting, Dict[str, Any]]] = []
     for job in jobs:
         result = score_job_hybrid(job, profile)
+        if any(flag.lower().startswith("ineligible:") for flag in result.get("flags", [])):
+            job.recommendation = "skip"
         job.score = result["score"]
         job.score_breakdown = result["score_breakdown"]
         job.missing_skills = result["missing_skills"]

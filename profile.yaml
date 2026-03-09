@@ -8,11 +8,13 @@ target:
     primary:
       - software_engineering
       - graduate_software
+      - automation_engineering
     secondary:
       - security_engineering
       - cyber_rotation
       - cloud_platform
       - devops
+      - platform_engineering
 
   preferred_locations:
     - sydney
@@ -30,6 +32,7 @@ target:
       - government
       - consulting
       - critical_infrastructure
+      - university
     value_reputation: true
     value_engineering_maturity: true
     value_structured_learning: true
@@ -47,6 +50,7 @@ target:
 eligibility:
   australian_citizen: true
   eligible_for_clearance: true
+  current_university: uts
 
 skills:
   strong:
@@ -60,22 +64,45 @@ skills:
     - git
     - ci/cd
     - api
-    - rest
+    - rest_api
+    - mysql
+    - postgresql
+    - database_design
+    - relational_databases
+    - relational_data_modelling
 
   working:
+    - c++
     - java
     - c#
-    - postgresql
+    - html
+    - css
+    - php
+    - azure
     - azure_devops
-    - relational_data_modelling
+    - automated_pipelines
+    - elastic_beanstalk
+    - ec2
+    - rds
     - deployment_automation
     - environment_configuration
+    - bash
+    - ssh
+    - networking
+    - cybersecurity
+    - wireshark
+    - packet_tracer
+    - ssl
+    - tls
+    - https
 
   basic:
     - docker
-    - security
-    - ssh
-    - tls
+    - ospf
+    - eigrp
+    - bgp
+    - ethereum
+    - geth
 
 weights:
   role_fit: 25
@@ -115,7 +142,7 @@ bonuses:
   security_interest:
     enabled: true
     boost_if_present:
-      - security
+      - cybersecurity
       - cyber
       - application_security
       - cloud_security
@@ -131,13 +158,73 @@ bonuses:
 
 normalization:
   synonym_map:
+    # Cloud
     amazon web services: aws
-    node.js: node
-    javascript: javascript
-    js: javascript
+    aws cloud: aws
+    aws platform: aws
+    google cloud platform: google cloud
+    gcp: google cloud
+    microsoft azure: azure
+    azure cloud: azure
+
+    # DevOps / CI
     ci cd: ci/cd
     cicd: ci/cd
-    rest api: rest
-    postgresql: postgresql
-    cyber security: security
-    cybersecurity: security
+    ci/cd pipelines: ci/cd
+    automated pipeline: automated_pipelines
+    automated pipelines: automated_pipelines
+    automation pipeline: automated_pipelines
+    automation pipelines: automated_pipelines
+    pipeline automation: automated_pipelines
+
+    # Backend / APIs
+    rest api: rest_api
+    rest apis: rest_api
+    restful api: rest_api
+    restful apis: rest_api
+    rest: rest_api
+    api development: api
+    api design: api
+    apis: api
+
+    # Databases
+    postgres: postgresql
+    postgresql database: postgresql
+    mysql database: mysql
+    relational database: relational_databases
+    relational databases: relational_databases
+    relational data modelling: relational_data_modelling
+    relational data modeling: relational_data_modelling
+    database design: database_design
+
+    # Programming
+    node.js: node
+    js: javascript
+    c plus plus: c++
+    cpp: c++
+
+    # DevOps platforms
+    azure devops: azure_devops
+    elastic beanstalk: elastic_beanstalk
+    beanstalk: elastic_beanstalk
+
+    # AWS services
+    ec2 instance: ec2
+    amazon ec2: ec2
+    amazon rds: rds
+    elastic beanstalk environment: elastic_beanstalk
+
+    # Security
+    cyber security: cybersecurity
+    information security: cybersecurity
+    security: cybersecurity
+    ssl/tls: tls
+
+    # Networking
+    packet tracer: packet_tracer
+    cisco packet tracer: packet_tracer
+    wireshark analysis: wireshark
+
+    # Systems
+    linux administration: linux
+    linux admin: linux

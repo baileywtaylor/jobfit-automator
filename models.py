@@ -23,7 +23,6 @@ class JobPosting(BaseModel):
     strategic_reasons: List[str] = Field(default_factory=list)
     caution_reasons: List[str] = Field(default_factory=list)
     ai_evaluation_evidence: Dict[str, Any] = Field(default_factory=dict)
-    ai_evaluation_evidence: Dict[str, Any] = Field(default_factory=dict)
 
     # Basic AI-enriched fields
     title: Optional[str] = None
@@ -46,7 +45,8 @@ class JobPosting(BaseModel):
     work_mode: Optional[str] = None            # onsite | hybrid | remote
 
     # Technology stack
-    tech_stack: List[str] = Field(default_factory=list)
+    tech_tools: List[str] = Field(default_factory=list)
+    tech_domains: List[str] = Field(default_factory=list)
 
     # Growth / learning signals
     growth_signals: List[str] = Field(default_factory=list)
@@ -54,6 +54,8 @@ class JobPosting(BaseModel):
     # Security signals
     citizenship_required: Optional[bool] = None
     clearance_required: Optional[bool] = None
+    university_restriction_present: Optional[bool] = None
+    required_university: Optional[str] = None
 
     # Contract / job structure
     contract_type: Optional[str] = None        # permanent | contract | internship | unknown
